@@ -11,7 +11,6 @@ from specforge.runtime.contracts import (
     PromptTask,
     SampleRef,
     TrainBatch,
-    WeightVersion,
     assert_no_tensors,
 )
 
@@ -87,15 +86,6 @@ class TestContracts(unittest.TestCase):
         self.assertIn("input_ids", batch.tensors)
         with self.assertRaises(TypeError):
             assert_no_tensors(batch)
-
-    def test_weight_version_frozen_metadata(self):
-        wv = WeightVersion(
-            version_id="v1", run_id="r", global_step=10, checkpoint_uri="file://ckpt",
-            metadata={"accept_length": 3.2},
-        )
-        self.assertEqual(wv.metadata["accept_length"], 3.2)
-        assert_no_tensors(wv)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -26,7 +26,7 @@ import abc
 import threading
 from typing import Any, Dict, List, Optional, Set
 
-from specforge.runtime.contracts import SampleRef, WeightVersion
+from specforge.runtime.contracts import SampleRef
 
 
 class MetadataStore(abc.ABC):
@@ -59,16 +59,8 @@ class MetadataStore(abc.ABC):
     def durable_marker(self) -> Dict[str, Any]:
         """{acked: set[str], global_step: int|None, optimizer_durable: bool}."""
 
-    # -- weight versions ---------------------------------------------------
-    @abc.abstractmethod
-    def put_weight_version(self, version: WeightVersion) -> None: ...
-
-    @abc.abstractmethod
-    def latest_weight_version(self) -> Optional[WeightVersion]:
-        """Highest global_step (NOT insertion order — rollback may publish older)."""
-
-    @abc.abstractmethod
-    def weight_version_count(self) -> int: ...
+    # NOTE: weight-version registry (put/latest/count) is deferred with the rest
+    # of the published-weight lifecycle (M7).
 
 
 class InMemoryMetadataStore(MetadataStore):
@@ -78,7 +70,6 @@ class InMemoryMetadataStore(MetadataStore):
         self._acked: Set[str] = set()
         self._global_step: Optional[int] = None
         self._optimizer_durable: bool = False
-        self._weight_versions: Dict[str, WeightVersion] = {}
 
     def commit_sample(self, ref: SampleRef) -> bool:
         with self._lock:
@@ -116,20 +107,6 @@ class InMemoryMetadataStore(MetadataStore):
                 "global_step": self._global_step,
                 "optimizer_durable": self._optimizer_durable,
             }
-
-    def put_weight_version(self, version: WeightVersion) -> None:
-        with self._lock:
-            self._weight_versions[version.version_id] = version
-
-    def latest_weight_version(self) -> Optional[WeightVersion]:
-        with self._lock:
-            if not self._weight_versions:
-                return None
-            return max(self._weight_versions.values(), key=lambda v: v.global_step)
-
-    def weight_version_count(self) -> int:
-        with self._lock:
-            return len(self._weight_versions)
 
 
 __all__ = ["MetadataStore", "InMemoryMetadataStore"]

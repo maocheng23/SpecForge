@@ -25,9 +25,6 @@ from __future__ import annotations
 
 from typing import Optional
 
-import torch
-
-from specforge.runtime.contracts import WeightVersion
 from specforge.runtime.control_plane import DataFlowController
 from specforge.runtime.data_plane import (
     FeatureDataLoader,
@@ -58,7 +55,6 @@ def build_offline_eagle3_controller(
     tp_size: int = 1,
     sp_ulysses_size: int = 1,
     sp_ring_size: int = 1,
-    publisher=None,
     logger=None,
 ):
     """Assemble the offline-EAGLE3 dataflow and return (controller, loader)."""
@@ -108,7 +104,6 @@ def build_offline_eagle3_controller(
         max_steps=max_steps,
         save_interval=save_interval,
         eval_interval=eval_interval,
-        publisher=publisher or controller.publish_weight_version,
         logger=logger,
         ack_fn=lambda ids, step: controller.ack_train_refs(
             trainer_id, ids, global_step=step, optimizer_durable=True

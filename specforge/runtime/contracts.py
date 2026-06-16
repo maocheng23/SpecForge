@@ -130,17 +130,11 @@ class TrainBatch:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class WeightVersion:
-    """An immutable published draft-weight version."""
-
-    version_id: str
-    run_id: str
-    global_step: int
-    checkpoint_uri: str
-    serving_uri: Optional[str] = None
-    format: Literal["hf", "safetensors", "specforge"] = "specforge"
-    metadata: Dict[str, Any] = field(default_factory=dict)
+# NOTE: the published-weight lifecycle (WeightVersion, WeightPublisher, hot
+# update, serving accept-length gate) is intentionally deferred to M7 — it is not
+# needed for the M1–M4 local train pipeline. SampleRef/PromptTask still carry a
+# ``draft_weight_version`` *string* as rollout provenance, but there is no
+# WeightVersion object or publisher here yet.
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +192,5 @@ __all__ = [
     "SampleRef",
     "FeatureHandle",
     "TrainBatch",
-    "WeightVersion",
     "assert_no_tensors",
 ]

@@ -29,12 +29,7 @@ import uuid
 from collections import OrderedDict, deque
 from typing import Any, Deque, Dict, List, Optional
 
-from specforge.runtime.contracts import (
-    PromptTask,
-    SampleRef,
-    WeightVersion,
-    assert_no_tensors,
-)
+from specforge.runtime.contracts import PromptTask, SampleRef, assert_no_tensors
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
@@ -212,13 +207,8 @@ class DataFlowController:
         ]
         self.sample_queue.fail(refs, reason, retryable)
 
-    # -- versions ----------------------------------------------------------
-    def publish_weight_version(self, version: WeightVersion) -> None:
-        assert_no_tensors(version)
-        self.store.put_weight_version(version)
-
-    def latest_weight_version(self) -> Optional[WeightVersion]:
-        return self.store.latest_weight_version()
+    # NOTE: weight publishing (publish_weight_version / latest_weight_version) is
+    # deferred with the rest of the weight-version lifecycle (M7).
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
@@ -238,7 +228,6 @@ class DataFlowController:
             "queue_in_flight": self.sample_queue.in_flight(),
             "rollout_workers": workers,
             "trainers": trainers,
-            "weight_versions": self.store.weight_version_count(),
             "durable_global_step": marker["global_step"],
             "durable_acked": len(marker["acked"]),
         }

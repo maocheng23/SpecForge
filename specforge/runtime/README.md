@@ -19,7 +19,7 @@ is why the equivalence gates are bit-exact.
 ```
 specforge/runtime/
   contracts.py            # PromptTask, FeatureSpec, SampleRef, FeatureHandle,
-                          #   TrainBatch, WeightVersion, assert_no_tensors
+                          #   TrainBatch, assert_no_tensors
   control_plane/
     controller.py         # DataFlowController (in-process; no-tensor invariant)
   data_plane/
@@ -35,8 +35,7 @@ specforge/runtime/
   training/
     strategy.py           # DraftTrainStrategy ABC + Eagle3/DFlash strategies
     backend.py            # TrainingBackend ABC + FSDPTrainingBackend + ParallelConfig
-    trainer.py            # TrainerCore (branch-free) + TrainerController
-    evaluation.py         # ServingAcceptLengthGate (B1)
+    trainer.py            # TrainerCore (branch-free) + TrainerController + Checkpoint
   launch.py               # wire the offline-EAGLE3 dataflow from a config
 ```
 
@@ -63,7 +62,7 @@ specforge/runtime/
 | **M2** | `test_sample_ref_queue.py`, `test_rollout_worker.py` (lease/ack, commit) | CPU/CI |
 | **M3** | `test_equiv_trainer_split.py` (paired single step) | GPU (rcli) |
 | **M3** | `test_checkpoint_resume.py` | GPU (rcli) |
-| **M3** | `test_trainer.py::TestServingGate` (accept_length populated) | CPU/CI |
+| **M3** | `test_trainer.py`, `test_seam_fixes.py` (core/accum/checkpoint/DFlash plug-in) | CPU/CI |
 | **M4** | `test_extraction_vs_hf_reference.py::test_extraction_vs_hf_reference` | GPU (rcli) |
 | **M4** | `test_capture.py` + `..._reference.py::test_capture_layer_mismatch_fails` | CPU/CI |
 
@@ -72,7 +71,7 @@ Plus contract/store/loader unit tests (`test_contracts.py`, `test_feature_store.
 
 ## Running the tests
 
-CPU/CI (control + data plane, capture, serving gate — no GPU, no model download):
+CPU/CI (control + data plane, capture, trainer core — no GPU, no model download):
 
 ```bash
 PYTHONPATH=$PWD python -m unittest discover -s tests/test_runtime -p "test_*.py" -v

@@ -1,5 +1,5 @@
 # coding=utf-8
-"""TrainerCore grad-accum + TrainerController fit/checkpoint + serving gate (CPU)."""
+"""TrainerCore grad-accum + TrainerController fit/checkpoint (CPU)."""
 
 import tempfile
 import unittest
@@ -7,14 +7,10 @@ import unittest
 import torch
 import torch.nn as nn
 
-from specforge.runtime.contracts import TrainBatch, WeightVersion
+from specforge.runtime.contracts import TrainBatch
 from specforge.runtime.training.backend import TrainingBackend
-from specforge.runtime.training.evaluation import (
-    AcceptLengthResult,
-    ServingAcceptLengthGate,
-)
 from specforge.runtime.training.strategy import DraftTrainStrategy, StepOutput
-from specforge.runtime.training.trainer import TrainerController, TrainerCore
+from specforge.runtime.training.trainer import Checkpoint, TrainerController, TrainerCore
 
 
 class TinyModel(nn.Module):
@@ -94,51 +90,18 @@ class TestTrainerController(unittest.TestCase):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
         core = TrainerCore(strat, backend, accumulation_steps=1)
-        published = []
         with tempfile.TemporaryDirectory() as d:
             ctrl = TrainerController(
                 core, run_id="r", output_dir=d, max_steps=3, num_epochs=5,
-                publisher=published.append,
             )
             data = [_batch() for _ in range(10)]
             step = ctrl.fit(data)
             self.assertEqual(step, 3)  # max_steps honored
             self.assertEqual(backend.steps, 3)
-            wv = ctrl.save_checkpoint(step)
-            self.assertIsInstance(wv, WeightVersion)
-            self.assertTrue(wv.checkpoint_uri.startswith("file://"))
-            self.assertEqual(published[-1].version_id, wv.version_id)
-
-
-class TestServingGate(unittest.TestCase):
-    def test_gate_populates_accept_length(self):
-        def bench(version, cfg):
-            return AcceptLengthResult(accept_length=3.4, speedup=1.8, serving_config=cfg)
-
-        gate = ServingAcceptLengthGate(
-            bench, baseline_accept_length=3.0, serving_config={"topk": 8}
-        )
-        wv = WeightVersion("v1", "r", 10, "file://ckpt")
-        out = gate.evaluate(wv)
-        self.assertEqual(out.metadata["accept_length"], 3.4)
-        self.assertTrue(out.metadata["promotable"])
-        self.assertEqual(out.metadata["serving_config"], {"topk": 8})
-
-    def test_gate_rejects_regression(self):
-        def bench(version, cfg):
-            return AcceptLengthResult(accept_length=2.5, speedup=1.1, serving_config=cfg)
-
-        gate = ServingAcceptLengthGate(bench, baseline_accept_length=3.0)
-        out = gate.evaluate(WeightVersion("v1", "r", 10, "file://ckpt"))
-        self.assertFalse(out.metadata["promotable"])  # below baseline
-
-    def test_gate_rejects_no_speedup(self):
-        def bench(version, cfg):
-            return AcceptLengthResult(accept_length=3.5, speedup=0.9, serving_config=cfg)
-
-        gate = ServingAcceptLengthGate(bench, baseline_accept_length=3.0)
-        out = gate.evaluate(WeightVersion("v1", "r", 10, "file://ckpt"))
-        self.assertFalse(out.metadata["promotable"])  # speedup < 1
+            ckpt = ctrl.save_checkpoint(step)
+            self.assertIsInstance(ckpt, Checkpoint)
+            self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
+            self.assertEqual(ckpt.global_step, 3)
 
 
 if __name__ == "__main__":

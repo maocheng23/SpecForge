@@ -161,10 +161,8 @@ class RolloutWorker:
         """Stop leasing new work; in-flight is finished by the active run_once."""
         self._state = "draining"
 
-    def update_weights(self, version) -> None:
-        self.draft_weight_version = getattr(version, "version_id", version)
-        if hasattr(self.feature_source, "update_draft_weights"):
-            self.feature_source.update_draft_weights(version)
+    # NOTE: draft-weight hot update (update_weights -> adapter) is deferred to M7.
+    # draft_weight_version is still recorded as rollout provenance on each sample.
 
     def health(self) -> Dict[str, Any]:
         return {

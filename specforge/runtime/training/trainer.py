@@ -23,13 +23,30 @@ EAGLE3 and DFlash share this lifecycle unchanged — only the strategy differs.
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Dict, Iterable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import torch
 
-from specforge.runtime.contracts import TrainBatch, WeightVersion
+from specforge.runtime.contracts import TrainBatch
 from specforge.runtime.training.backend import TrainingBackend
 from specforge.runtime.training.strategy import DraftTrainStrategy, StepOutput
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """A saved training checkpoint location (resume target).
+
+    Deliberately NOT a published "weight version" — the published-weight
+    lifecycle (versioning, publisher, serving accept-length gate, hot update) is
+    deferred to M7. This record only says where a checkpoint is and at what step.
+    """
+
+    checkpoint_uri: str
+    global_step: int
+    epoch: int
+    strategy: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 def _scalar(x: Any) -> float:
@@ -86,7 +103,11 @@ class TrainerCore:
 
 
 class TrainerController:
-    """Lifecycle: fit / evaluate / checkpoint / publish. Script becomes a launcher."""
+    """Lifecycle: fit / evaluate / checkpoint. Script becomes a launcher.
+
+    Weight publishing + the serving accept-length gate are deferred to M7;
+    save_checkpoint just persists training state and returns a Checkpoint.
+    """
 
     def __init__(
         self,
@@ -99,9 +120,7 @@ class TrainerController:
         log_interval: int = 50,
         max_steps: Optional[int] = None,
         num_epochs: int = 1,
-        publisher: Optional[Callable[[WeightVersion], None]] = None,
         logger: Optional[Callable[[Dict[str, Any], int], None]] = None,
-        serving_gate=None,
         ack_fn: Optional[Callable[[List[str], int], None]] = None,
         start_step: int = 0,
         start_epoch: int = 0,
@@ -114,11 +133,7 @@ class TrainerController:
         self.log_interval = log_interval
         self.max_steps = max_steps
         self.num_epochs = num_epochs
-        self.publisher = publisher
         self.logger = logger
-        # serving accept-length gate (B1): if set, save_checkpoint runs it so the
-        # published WeightVersion carries metadata.accept_length.
-        self.serving_gate = serving_gate
         # ack_fn(sample_ids, global_step): acks consumed refs at the optimizer-step
         # boundary with the step number, so the controller records the durable
         # {acked, global_step, optimizer marker} transaction. If None, the loader
@@ -174,7 +189,7 @@ class TrainerController:
                     agg.setdefault(k, []).append(v)
         return {k: sum(vs) / len(vs) for k, vs in agg.items() if vs}
 
-    def save_checkpoint(self, step: int) -> WeightVersion:
+    def save_checkpoint(self, step: int) -> Checkpoint:
         ckpt_dir = os.path.join(self.output_dir, f"{self.run_id}-step{step}")
         is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
         full_state = self.core.backend.state_dict()
@@ -193,21 +208,12 @@ class TrainerController:
             )
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
-        version = WeightVersion(
-            version_id=f"{self.run_id}-step{step}",
-            run_id=self.run_id,
-            global_step=step,
+        return Checkpoint(
             checkpoint_uri=f"file://{os.path.abspath(ckpt_dir)}",
-            format="specforge",
-            metadata={"strategy": self.core.strategy.name, "epoch": self.epoch},
+            global_step=step,
+            epoch=self.epoch,
+            strategy=self.core.strategy.name,
         )
-        # B1 serving accept-length gate: a version is not promotable until a real
-        # serving measurement records accept_length/speedup into its metadata.
-        if self.serving_gate is not None:
-            version = self.serving_gate.evaluate(version)
-        if self.publisher is not None:
-            self.publisher(version)
-        return version
 
 
-__all__ = ["TrainerCore", "TrainerController"]
+__all__ = ["TrainerCore", "TrainerController", "Checkpoint"]

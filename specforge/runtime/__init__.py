@@ -18,7 +18,6 @@ from specforge.runtime.contracts import (  # noqa: F401
     PromptTask,
     SampleRef,
     TrainBatch,
-    WeightVersion,
     assert_no_tensors,
 )
 
@@ -29,6 +28,5 @@ __all__ = [
     "SampleRef",
     "FeatureHandle",
     "TrainBatch",
-    "WeightVersion",
     "assert_no_tensors",
 ]

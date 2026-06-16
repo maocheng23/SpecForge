@@ -8,14 +8,10 @@ import unittest
 import torch
 import torch.nn as nn
 
-from specforge.runtime.contracts import FeatureSpec, SampleRef, TrainBatch, WeightVersion
+from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.control_plane import DataFlowController, InMemoryMetadataStore
 from specforge.runtime.training.backend import ParallelConfig, TrainingBackend
-from specforge.runtime.training.evaluation import (
-    AcceptLengthResult,
-    ServingAcceptLengthGate,
-)
-from specforge.runtime.training.strategy import DFlashTrainStrategy, StepOutput
+from specforge.runtime.training.strategy import DFlashTrainStrategy
 from specforge.runtime.training.trainer import TrainerController, TrainerCore
 
 
@@ -57,13 +53,6 @@ class TestMetadataStore(unittest.TestCase):
         self.assertTrue(s.commit_sample(_ref(0)))
         self.assertFalse(s.commit_sample(_ref(0)))  # dup
         self.assertEqual(s.committed_count(), 1)
-
-    def test_latest_weight_version_by_max_global_step(self):
-        s = InMemoryMetadataStore()
-        s.put_weight_version(WeightVersion("v5", "r", 5, "file://a"))
-        s.put_weight_version(WeightVersion("v3", "r", 3, "file://b"))  # inserted later
-        # must pick max(global_step)=5, NOT insertion-order-latest (v3)
-        self.assertEqual(s.latest_weight_version().version_id, "v5")
 
 
 class TestTrainLease(unittest.TestCase):
@@ -167,25 +156,20 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
             strat.forward_loss(bad)
 
 
-class TestServingGateOnCheckpoint(unittest.TestCase):
-    def test_save_checkpoint_runs_gate(self):
+class TestCheckpointRecord(unittest.TestCase):
+    def test_save_checkpoint_returns_plain_record(self):
         model = _FakeDFlashModel()
         strat = DFlashTrainStrategy(model)
         backend = _FakeBackend(model)
         backend.prepare_model(model)
         core = TrainerCore(strat, backend)
-        gate = ServingAcceptLengthGate(
-            lambda v, cfg: AcceptLengthResult(3.5, 1.5, cfg),
-            baseline_accept_length=3.0,
-        )
-        published = []
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(core, run_id="r", output_dir=d,
-                                     serving_gate=gate, publisher=published.append)
-            wv = ctrl.save_checkpoint(10)
-        self.assertEqual(wv.metadata["accept_length"], 3.5)
-        self.assertTrue(wv.metadata["promotable"])
-        self.assertEqual(published[-1].metadata["accept_length"], 3.5)
+            ctrl = TrainerController(core, run_id="r", output_dir=d)
+            ckpt = ctrl.save_checkpoint(10)
+        # weight-version/publish/serving-gate deferred to M7: just a checkpoint record
+        self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
+        self.assertEqual(ckpt.global_step, 10)
+        self.assertEqual(ckpt.strategy, "dflash")
 
 
 if __name__ == "__main__":

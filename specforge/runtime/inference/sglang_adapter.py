@@ -129,10 +129,7 @@ class SGLangAdapter:
                 }
         return out
 
-    def update_draft_weights(self, version) -> None:
-        # online draft hot-update (M7); rollout uses target features only in M2-M6.
-        if hasattr(self.target_model, "update_draft_weights"):
-            self.target_model.update_draft_weights(version)
+    # NOTE: draft-weight hot update (update_draft_weights) is deferred to M7.
 
     def health(self) -> Dict[str, Any]:
         return {
