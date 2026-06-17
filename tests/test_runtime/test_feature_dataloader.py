@@ -8,7 +8,6 @@ from dataclasses import replace
 
 import torch
 
-from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
@@ -53,12 +52,14 @@ class TestFeatureDataLoader(unittest.TestCase):
     def test_offline_loader_emits_trainbatch(self):
         with tempfile.TemporaryDirectory() as d:
             self._write_offline_files(d, n=4)
-            ctrl = DataFlowController("run")
-            ctrl.enqueue_offline_refs(OfflineManifestReader(d, run_id="run").read())
+            # data-plane unit test: drive the loader from the queue primitive
+            # directly (no control plane needed here).
+            q = SampleRefQueue()
+            q.put(OfflineManifestReader(d, run_id="run").read())
             store = LocalFeatureStore("st")
             loader = FeatureDataLoader(
                 store,
-                ctrl.sample_queue,
+                q,
                 batch_size=2,
                 collate_fn=_simple_collate,
                 per_sample_transform=_offline_eagle3_process_data,
@@ -73,8 +74,8 @@ class TestFeatureDataLoader(unittest.TestCase):
             # aux<->target swap preserved
             self.assertEqual(b.metadata["target_repr"], "hidden_state")
             # all refs acked
-            self.assertEqual(ctrl.sample_queue.in_flight(), 0)
-            self.assertEqual(ctrl.sample_queue.depth(), 0)
+            self.assertEqual(q.in_flight(), 0)
+            self.assertEqual(q.depth(), 0)
 
     def test_drop_last(self):
         with tempfile.TemporaryDirectory() as d:
