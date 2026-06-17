@@ -139,7 +139,11 @@ class TrainerController:
         # {acked, global_step, optimizer marker} transaction. If None, the loader
         # is assumed to ack (e.g. simple/equivalence runs).
         self.ack_fn = ack_fn
+        # global_step counts OPTIMIZER steps (increments only at a grad-accum
+        # boundary), so ack / checkpoint / resume semantics are in true optimizer
+        # steps. micro_step counts forward/backward micro-batches.
         self.global_step = start_step
+        self.micro_step = 0
         self.epoch = start_epoch
         self.last_metrics: Dict[str, Any] = {}
 
@@ -152,12 +156,18 @@ class TrainerController:
             if hasattr(data, "set_epoch"):
                 data.set_epoch(epoch)
             for batch in data:
-                self.global_step += 1
-                pending_ack.extend(batch.sample_ids)
+                self.micro_step += 1
+                if self.ack_fn is not None:
+                    pending_ack.extend(batch.sample_ids)
                 metrics = self.core.train_step(batch)
                 self.last_metrics = metrics
-                # "grad_norm" present == optimizer stepped (grad-accum boundary).
-                if self.ack_fn is not None and "grad_norm" in metrics:
+                # No "grad_norm" -> grad accumulated but optimizer has not stepped
+                # yet. Everything keyed on optimizer steps fires only at the boundary.
+                if "grad_norm" not in metrics:
+                    continue
+                self.global_step += 1
+                if self.ack_fn is not None:
+                    # durable ack transaction at the optimizer-step boundary
                     self.ack_fn(pending_ack, self.global_step)
                     pending_ack = []
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:

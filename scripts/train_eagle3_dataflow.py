@@ -57,19 +57,21 @@ def main():
         kl_scale=args.kl_scale,
         kl_decay=args.kl_decay,
     ).cuda()
-    optimizer = BF16Optimizer(
-        draft_model,
-        lr=args.learning_rate,
-        max_grad_norm=args.max_grad_norm,
-        warmup_ratio=args.warmup_ratio,
-        total_steps=args.total_steps or 10_000,
-    )
+    # built AFTER FSDP-wrap (inside the runtime) over the wrapped inner draft
+    def optimizer_factory(draft_module):
+        return BF16Optimizer(
+            draft_module,
+            lr=args.learning_rate,
+            max_grad_norm=args.max_grad_norm,
+            warmup_ratio=args.warmup_ratio,
+            total_steps=args.total_steps or 10_000,
+        )
 
     trainer, loader = build_offline_eagle3_runtime(
         hidden_states_path=args.train_hidden_states_path,
         eagle3_model=eagle3_model,
         target_head=target_head,
-        optimizer=optimizer,
+        optimizer_factory=optimizer_factory,
         run_id="eagle3-offline",
         output_dir=args.output_dir,
         ttt_length=args.ttt_length,

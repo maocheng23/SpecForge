@@ -41,7 +41,7 @@ def build_offline_eagle3_runtime(
     hidden_states_path: str,
     eagle3_model,
     target_head,
-    optimizer,
+    optimizer_factory,
     run_id: str,
     output_dir: str,
     ttt_length: int = 7,
@@ -57,7 +57,12 @@ def build_offline_eagle3_runtime(
     sp_ring_size: int = 1,
     logger=None,
 ):
-    """Assemble the offline-EAGLE3 dataflow and return (trainer, loader)."""
+    """Assemble the offline-EAGLE3 dataflow and return (trainer, loader).
+
+    ``optimizer_factory(draft_module) -> optimizer`` is invoked AFTER the model is
+    FSDP-wrapped, over the wrapped module's inner draft, so the optimizer owns the
+    FSDP-managed parameters.
+    """
     from specforge.data.preprocessing import OfflineEagle3Dataset
     from specforge.data.utils import DataCollatorWithPadding
 
@@ -91,10 +96,14 @@ def build_offline_eagle3_runtime(
     parallel = ParallelConfig.from_distributed(
         tp_size=tp_size, sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size
     )
-    backend = FSDPTrainingBackend(parallel)
-    backend.prepare_model(eagle3_model)
-    backend.set_optimizer(optimizer)
-    strategy = Eagle3TrainStrategy(eagle3_model, target_head=target_head)
+    backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
+    # FSDP-wrap the composite model and build the optimizer over the inner draft
+    # AFTER wrapping; the strategy MUST run forward through the wrapped module so
+    # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
+    wrapped = backend.prepare_model(
+        eagle3_model, optimizer_target=eagle3_model.draft_model
+    )
+    strategy = Eagle3TrainStrategy(wrapped, target_head=target_head)
     core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
     trainer = TrainerController(
         core,
