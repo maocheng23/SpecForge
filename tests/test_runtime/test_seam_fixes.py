@@ -1,6 +1,9 @@
 # coding=utf-8
-"""CPU tests for the do-now seam fixes: durable ack, MetadataStore, TrainLease,
-partition_key, ParallelConfig handles, serving-gate-on-checkpoint, DFlash plug-in."""
+"""CPU tests for do-now seam fixes.
+
+Covered here: durable ack, MetadataStore, TrainLease, partition_key,
+ParallelConfig handles, checkpoint record shape, and DFlash plug-in wiring.
+"""
 
 import tempfile
 import unittest

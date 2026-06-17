@@ -36,7 +36,7 @@ from specforge.runtime.training.strategy import Eagle3TrainStrategy
 from specforge.runtime.training.trainer import TrainerController, TrainerCore
 
 
-def build_offline_eagle3_controller(
+def build_offline_eagle3_runtime(
     *,
     hidden_states_path: str,
     eagle3_model,
@@ -57,7 +57,7 @@ def build_offline_eagle3_controller(
     sp_ring_size: int = 1,
     logger=None,
 ):
-    """Assemble the offline-EAGLE3 dataflow and return (controller, loader)."""
+    """Assemble the offline-EAGLE3 dataflow and return (trainer, loader)."""
     from specforge.data.preprocessing import OfflineEagle3Dataset
     from specforge.data.utils import DataCollatorWithPadding
 
@@ -112,4 +112,8 @@ def build_offline_eagle3_controller(
     return trainer, loader
 
 
-__all__ = ["build_offline_eagle3_controller"]
+# Backward-compatible alias for early branch users.
+build_offline_eagle3_controller = build_offline_eagle3_runtime
+
+
+__all__ = ["build_offline_eagle3_controller", "build_offline_eagle3_runtime"]

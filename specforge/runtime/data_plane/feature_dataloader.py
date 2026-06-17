@@ -66,6 +66,42 @@ class FeatureDataLoader:
         self.strategy = strategy
         self.ack = ack
 
+    def _validate_refs(self, refs: List[SampleRef]) -> None:
+        strategies = {ref.strategy for ref in refs}
+        if strategies != {self.strategy}:
+            raise ValueError(
+                f"loader strategy={self.strategy!r} received refs with "
+                f"strategies={sorted(strategies)}"
+            )
+
+        schema_versions = {ref.schema_version for ref in refs}
+        if len(schema_versions) != 1:
+            raise ValueError(f"mixed schema versions in batch: {sorted(schema_versions)}")
+
+        target_reprs = {ref.metadata.get("target_repr") for ref in refs}
+        if len(target_reprs) != 1:
+            raise ValueError(
+                f"mixed target_repr values in batch: {sorted(map(repr, target_reprs))}"
+            )
+
+        spec_sets = [set(ref.feature_specs) for ref in refs if ref.feature_specs]
+        if spec_sets and any(spec_set != spec_sets[0] for spec_set in spec_sets[1:]):
+            raise ValueError(f"mixed feature spec names in batch: {spec_sets}")
+
+        if not spec_sets:
+            return
+        first_specs = next(ref.feature_specs for ref in refs if ref.feature_specs)
+        for ref in refs:
+            if not ref.feature_specs:
+                continue
+            for name, spec in ref.feature_specs.items():
+                expected = first_specs[name]
+                if spec.dtype != expected.dtype or len(spec.shape) != len(expected.shape):
+                    raise ValueError(
+                        f"incompatible feature spec for sample {ref.sample_id}, "
+                        f"feature {name!r}: {spec} vs {expected}"
+                    )
+
     def _materialize(self, ref: SampleRef) -> Dict[str, torch.Tensor]:
         tensors, handle = self.store.get(ref, device=self.device)
         if self.clone_on_fetch:
@@ -85,8 +121,20 @@ class FeatureDataLoader:
                 # then stop (mirrors DataLoader(drop_last=True) per epoch pass).
                 self.queue.fail(refs, reason="drop_last", retryable=True)
                 return
-            per_sample = [self._materialize(r) for r in refs]
-            batch_tensors = self.collate_fn(per_sample)
+            try:
+                self._validate_refs(refs)
+                per_sample = [self._materialize(r) for r in refs]
+                batch_tensors = self.collate_fn(per_sample)
+                non_tensors = [
+                    name
+                    for name, value in batch_tensors.items()
+                    if not isinstance(value, torch.Tensor)
+                ]
+                if non_tensors:
+                    raise TypeError(f"collate_fn returned non-tensors for {non_tensors}")
+            except Exception as exc:
+                self.queue.fail(refs, reason=f"materialize:{exc}", retryable=False)
+                raise
             batch = TrainBatch(
                 sample_ids=[r.sample_id for r in refs],
                 strategy=self.strategy,

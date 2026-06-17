@@ -108,7 +108,7 @@ class FeatureStore(abc.ABC):
         ...
 
 
-def _load_ckpt(path: str) -> Dict[str, torch.Tensor]:
+def load_feature_file(path: str) -> Dict[str, torch.Tensor]:
     """Load a SpecForge offline feature file (mirrors OfflineEagle3Dataset)."""
     if path.endswith(".gz"):
         with gzip.open(path, "rb") as f:
@@ -249,7 +249,7 @@ class LocalFeatureStore(FeatureStore):
     def _get_from_file(
         self, path: str, ref: SampleRef, wanted: List[str]
     ) -> Dict[str, torch.Tensor]:
-        raw = _load_ckpt(path)
+        raw = load_feature_file(path)
         out = {}
         for n in wanted:
             # feature_keys may remap a logical name -> a raw file key.
@@ -291,4 +291,4 @@ class LocalFeatureStore(FeatureStore):
             }
 
 
-__all__ = ["FeatureStore", "LocalFeatureStore", "spec_from_tensor"]
+__all__ = ["FeatureStore", "LocalFeatureStore", "load_feature_file", "spec_from_tensor"]

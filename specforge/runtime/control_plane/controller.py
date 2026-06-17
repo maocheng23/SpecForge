@@ -8,22 +8,22 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """DataFlowController: the metadata-only scheduler / debug boundary.
 
-The controller owns prompt and sample lifecycle, leases, worker registration,
-and version policy. It NEVER touches tensors — every public method that accepts
+The controller owns prompt and sample lifecycle, leases, and worker registration.
+It NEVER touches tensors — every public method that accepts
 a record runs ``assert_no_tensors`` (this is what ``test_controller_carries_no_tensor``
 exercises). All large tensors travel through the data plane (FeatureStore);
 online ``commit_samples`` and offline ``enqueue_offline_refs`` converge onto the
 same ``SampleRefQueue`` so the trainer path has no online/offline branch.
 
-Recovery-critical state (committed-sample dedup, the durable ack transaction,
-weight versions) lives behind a ``MetadataStore`` so a durable backend (SQLite →
-Redis/DB) is a swap, not a rewrite. Phase 1 is in-process; the public surface
-already matches the durable controller shape so a later Ray/service deployment
-is mechanical.
+Recovery-critical state (committed-sample dedup and the durable ack transaction)
+lives behind a ``MetadataStore`` so a durable backend (SQLite → Redis/DB) is a
+swap, not a rewrite. Phase 1 is in-process; the public surface already matches
+the durable controller shape so a later Ray/service deployment is mechanical.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import uuid
 from collections import OrderedDict, deque
@@ -87,6 +87,7 @@ class DataFlowController:
         self._prompts: "OrderedDict[str, PromptTask]" = OrderedDict()
         self._prompt_pending: Deque[str] = deque()
         self._prompt_leased: Dict[str, str] = {}  # task_id -> worker_id
+        self._prompt_failed: Dict[str, str] = {}  # task_id -> terminal reason
         self._workers: Dict[str, Dict[str, Any]] = {}
         self._trainers: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -147,6 +148,33 @@ class DataFlowController:
                 self._prompt_leased[task_id] = worker_id
                 out.append(self._prompts[task_id])
         return out
+
+    def fail_prompt_tasks(
+        self, worker_id: str, task_ids: List[str], reason: str, retryable: bool
+    ) -> None:
+        """Release failed prompt leases and optionally requeue them.
+
+        This is intentionally separate from ``fail_refs``. Prompt failures happen
+        before a ``SampleRef`` exists, so routing them through the train-sample
+        queue would be a no-op and would leave prompt leases stuck.
+        """
+        with self._lock:
+            for task_id in task_ids:
+                owner = self._prompt_leased.get(task_id)
+                if owner is not None and owner != worker_id:
+                    continue
+                self._prompt_leased.pop(task_id, None)
+                task = self._prompts.get(task_id)
+                if task is None:
+                    continue
+                if retryable:
+                    self._prompts[task_id] = dataclasses.replace(
+                        task, attempt=task.attempt + 1
+                    )
+                    if task_id not in self._prompt_pending:
+                        self._prompt_pending.append(task_id)
+                else:
+                    self._prompt_failed[task_id] = reason
 
     def commit_samples(self, worker_id: str, refs: List[SampleRef]) -> None:
         fresh: List[SampleRef] = []
@@ -215,6 +243,7 @@ class DataFlowController:
             prompts = len(self._prompts)
             pending = len(self._prompt_pending)
             leased = len(self._prompt_leased)
+            failed = len(self._prompt_failed)
             workers = len(self._workers)
             trainers = len(self._trainers)
         marker = self.store.durable_marker()
@@ -223,6 +252,7 @@ class DataFlowController:
             "prompts": prompts,
             "prompts_pending": pending,
             "prompts_leased": leased,
+            "prompts_failed": failed,
             "samples_committed": self.store.committed_count(),
             "queue_depth": self.sample_queue.depth(),
             "queue_in_flight": self.sample_queue.in_flight(),

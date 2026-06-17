@@ -96,7 +96,7 @@ class RolloutWorker:
         except Exception as exc:  # rollout failure before any feature write
             self._state = "unhealthy"
             self._recent_failures.append(f"generate_features: {exc}")
-            self.controller.fail_refs(
+            self.controller.fail_prompt_tasks(
                 self.worker_id,
                 [t.task_id for t in tasks],
                 reason=f"generate_features:{exc}",
@@ -104,8 +104,21 @@ class RolloutWorker:
             )
             self._inflight = 0
             raise
+        if len(feats_list) != len(tasks):
+            reason = (
+                f"generate_features returned {len(feats_list)} feature records "
+                f"for {len(tasks)} tasks"
+            )
+            self._state = "unhealthy"
+            self._recent_failures.append(reason)
+            self.controller.fail_prompt_tasks(
+                self.worker_id, [t.task_id for t in tasks], reason=reason, retryable=False
+            )
+            self._inflight = 0
+            raise ValueError(reason)
 
         refs: List[SampleRef] = []
+        capture_error: Optional[CaptureMismatchError] = None
         for task, feats in zip(tasks, feats_list):
             sample_id = self._sample_id(task)
             recorded = feats.pop("__aux_layer_ids__", None)
@@ -117,12 +130,15 @@ class RolloutWorker:
                     recorded_aux_layer_ids=recorded,
                 )
             except CaptureMismatchError as exc:
-                # loud failure: do not persist a corrupt sample
+                # Loud failure: do not persist a corrupt sample, but keep this
+                # batch's other prompt leases moving so no lease is stranded.
                 self._recent_failures.append(str(exc))
-                self.controller.fail_refs(
+                self.controller.fail_prompt_tasks(
                     self.worker_id, [task.task_id], reason=str(exc), retryable=False
                 )
-                raise
+                if capture_error is None:
+                    capture_error = exc
+                continue
             try:
                 ref = self.feature_store.put(
                     feats,
@@ -131,7 +147,7 @@ class RolloutWorker:
                 )
             except Exception as exc:  # partial write -> abort, report
                 self.feature_store.abort(sample_id, reason=f"put_failed:{exc}")
-                self.controller.fail_refs(
+                self.controller.fail_prompt_tasks(
                     self.worker_id, [task.task_id], reason=str(exc), retryable=True
                 )
                 continue
@@ -141,6 +157,9 @@ class RolloutWorker:
             self.controller.commit_samples(self.worker_id, refs)
             self._last_commit_count += len(refs)
         self._inflight = 0
+        if capture_error is not None:
+            self._state = "unhealthy"
+            raise capture_error
         return refs
 
     def _put_metadata(self, task: PromptTask) -> Dict[str, Any]:

@@ -21,6 +21,7 @@ entry points, not at ``specforge.runtime`` package load.
 from __future__ import annotations
 
 import abc
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -29,6 +30,7 @@ import torch.nn as nn
 from specforge.runtime.contracts import TrainBatch
 
 
+@dataclass(frozen=True)
 class StepOutput:
     """Opaque per-step result a strategy hands back for metric aggregation.
 
@@ -36,9 +38,8 @@ class StepOutput:
     strategy (DFlash) share one trainer loop.
     """
 
-    def __init__(self, loss: torch.Tensor, metrics: Dict[str, Any]):
-        self.loss = loss
-        self.metrics = metrics
+    loss: torch.Tensor
+    metrics: Dict[str, Any]
 
 
 class DraftTrainStrategy(abc.ABC):

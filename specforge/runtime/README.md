@@ -54,6 +54,12 @@ specforge/runtime/
 
 ## Milestone status & exit-gate tests
 
+This branch implements the local DataFlow spine and the focused tests below. It
+does **not** complete every acceptance item from the refactor plan: the
+`WeightVersion` serving accept-length gate, full optimizer/scheduler resume, and
+moving the production DFlash script onto the shared lifecycle remain follow-up
+work.
+
 | M | Gate test (`tests/test_runtime/`) | Where it runs |
 |---|---|---|
 | **M1** | `test_controller_no_tensor.py::...test_controller_carries_no_tensor` | CPU/CI |

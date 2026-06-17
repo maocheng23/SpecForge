@@ -10,12 +10,12 @@
 
 The controller's *recovery-critical* state — committed sample dedup, the
 at-least-once durable ack transaction (``{acked sample_ids, global_step,
-optimizer-durable marker}`` from ADR-0002 / failure_recovery.md B4), and
-published weight versions — lives behind this interface rather than in inline
-dicts. Phase 1 ships ``InMemoryMetadataStore``; a SQLite (dev) or Redis/DB
-(prod) backend is then a *new subclass*, not a method-by-method rewrite of the
-controller. The single durable transaction (``record_train_ack``) is the unit a
-restart reconciles release state from.
+optimizer-durable marker}`` from ADR-0002 / failure_recovery.md B4) — lives
+behind this interface rather than in inline dicts. Phase 1 ships
+``InMemoryMetadataStore``; a SQLite (dev) or Redis/DB (prod) backend is then a
+*new subclass*, not a method-by-method rewrite of the controller. The single
+durable transaction (``record_train_ack``) is the unit a restart reconciles
+release state from.
 
 Dependency-light (stdlib only) so it stays importable without torch.
 """

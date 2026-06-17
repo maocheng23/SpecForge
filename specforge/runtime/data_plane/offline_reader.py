@@ -22,13 +22,36 @@ the model code.
 from __future__ import annotations
 
 import os
-from typing import Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
-from specforge.runtime.contracts import SampleRef
+from specforge.runtime.contracts import SCHEMA_VERSION, FeatureSpec, SampleRef
+from specforge.runtime.data_plane.feature_store import load_feature_file, spec_from_tensor
 
 _FEATURE_SUFFIXES = (".ckpt", ".ckpt.gz")
 # Raw keys present in a SpecForge offline EAGLE3 feature file.
 _OFFLINE_EAGLE3_KEYS = ("input_ids", "loss_mask", "hidden_state", "aux_hidden_state")
+
+
+def _inspect_feature_file(
+    path: str, feature_keys: Tuple[str, ...]
+) -> Tuple[Dict[str, FeatureSpec], int, int]:
+    raw = load_feature_file(path)
+    missing = [key for key in feature_keys if key not in raw]
+    if missing:
+        raise KeyError(f"{path} missing required offline feature keys {missing}")
+
+    specs: Dict[str, FeatureSpec] = {}
+    estimated_bytes = 0
+    for key in feature_keys:
+        value = raw[key]
+        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+            raise TypeError(f"{path} feature {key!r} is not a tensor: {type(value)!r}")
+        specs[key] = spec_from_tensor(key, value)
+        estimated_bytes += int(value.numel() * value.element_size())
+
+    input_ids = raw.get("input_ids")
+    num_tokens = int(input_ids.numel()) if input_ids is not None else 0
+    return specs, num_tokens, estimated_bytes
 
 
 def list_feature_files(path: str) -> List[str]:
@@ -59,6 +82,7 @@ class OfflineManifestReader:
         ttt_length: int = 7,
         max_len: int = 2048,
         target_repr: str = "hidden_state",
+        validate_files: bool = True,
     ) -> None:
         self.hidden_states_path = hidden_states_path
         self.run_id = run_id
@@ -69,22 +93,34 @@ class OfflineManifestReader:
         self.ttt_length = ttt_length
         self.max_len = max_len
         self.target_repr = target_repr
+        self.validate_files = validate_files
 
     def _ref_for(self, index: int, path: str) -> SampleRef:
         sample_id = f"{self.run_id}:{index:08d}"
+        specs: Dict[str, FeatureSpec] = {}
+        num_tokens = 0
+        estimated_bytes = 0
+        if self.validate_files:
+            specs, num_tokens, estimated_bytes = _inspect_feature_file(
+                path, self.feature_keys
+            )
         return SampleRef(
             sample_id=sample_id,
             run_id=self.run_id,
             source_task_id=None,
             feature_store_uri=f"file://{path}",
             feature_keys={k: k for k in self.feature_keys},
-            feature_specs={},  # raw shapes validated lazily at load time
+            feature_specs=specs,
             strategy=self.strategy,
+            schema_version=SCHEMA_VERSION,
             target_model_version=self.target_model_version,
             tokenizer_version=self.tokenizer_version,
+            num_tokens=num_tokens,
+            estimated_bytes=estimated_bytes,
             metadata={
                 "format": "offline_eagle3",
                 "target_repr": self.target_repr,
+                "schema_version": SCHEMA_VERSION,
                 "ttt_length": self.ttt_length,
                 "max_len": self.max_len,
                 "file_index": index,

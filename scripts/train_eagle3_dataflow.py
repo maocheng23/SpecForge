@@ -19,7 +19,7 @@ from accelerate.utils import set_seed
 
 from specforge.distributed import destroy_distributed, init_distributed
 from specforge.optimizer import BF16Optimizer
-from specforge.runtime.launch import build_offline_eagle3_controller
+from specforge.runtime.launch import build_offline_eagle3_runtime
 
 # reuse existing builders so model construction is not duplicated
 from train_eagle3 import build_draft_model, build_dataloaders, build_target_model, parse_args
@@ -65,7 +65,7 @@ def main():
         total_steps=args.total_steps or 10_000,
     )
 
-    trainer, loader = build_offline_eagle3_controller(
+    trainer, loader = build_offline_eagle3_runtime(
         hidden_states_path=args.train_hidden_states_path,
         eagle3_model=eagle3_model,
         target_head=target_head,

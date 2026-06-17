@@ -37,6 +37,9 @@ The extraction-correctness gate must be green on every pinned version. `status`:
 | `dev` (`lmsysorg/sglang:dev`) | 2.11 / 5.8 | sglang, hf, custom | `set_eagle3_layers_to_capture` | validated (H200 box) |
 | `0.5.9` (pyproject pin) | 2.9.1 / 4.57.1 | sglang, hf, custom | `set_eagle3_layers_to_capture` | target |
 
+`0.5.9` is the dependency pin, but it is not an M4 sign-off until the
+extraction-correctness gate is green on that exact image/version.
+
 The **HF backend** path (`HFEagle3TargetModel`, forward hooks on the aux layers)
 is version-robust and is what `test_extraction_vs_hf_reference` exercises in CI
 without a GPU SGLang server; the **sglang backend** is validated on the GPU box.

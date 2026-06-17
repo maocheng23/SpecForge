@@ -85,11 +85,20 @@ class TestLocalFeatureStore(unittest.TestCase):
             refs = OfflineManifestReader(d, run_id="off").read()
             self.assertEqual(len(refs), 1)
             self.assertTrue(refs[0].feature_store_uri.startswith("file://"))
+            self.assertEqual(set(refs[0].feature_specs), set(raw))
+            self.assertEqual(refs[0].feature_specs["hidden_state"].dtype, "float32")
+            self.assertEqual(refs[0].num_tokens, 8)
             store = LocalFeatureStore("st")
             out, handle = store.get(refs[0])
             self.assertEqual(set(out), set(raw))
             self.assertTrue(torch.equal(out["aux_hidden_state"], raw["aux_hidden_state"]))
             store.release(handle)
+
+    def test_offline_reader_rejects_missing_required_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            torch.save({"input_ids": torch.arange(4)}, os.path.join(d, "bad.ckpt"))
+            with self.assertRaises(KeyError):
+                OfflineManifestReader(d, run_id="off").read()
 
 
 if __name__ == "__main__":

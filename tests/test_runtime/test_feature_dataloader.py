@@ -4,6 +4,7 @@
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 
 import torch
 
@@ -87,6 +88,28 @@ class TestFeatureDataLoader(unittest.TestCase):
             )
             batches = list(loader)
             self.assertEqual(len(batches), 1)  # 3 samples, drop the trailing 1
+
+    def test_mixed_target_repr_fails_and_releases_refs(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=2)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            refs[1] = replace(
+                refs[1],
+                metadata={**refs[1].metadata, "target_repr": "logits"},
+            )
+            q = SampleRefQueue()
+            q.put(refs)
+            loader = FeatureDataLoader(
+                LocalFeatureStore("st"),
+                q,
+                batch_size=2,
+                collate_fn=_simple_collate,
+                per_sample_transform=_offline_eagle3_process_data,
+            )
+            with self.assertRaises(ValueError):
+                list(loader)
+            self.assertEqual(q.in_flight(), 0)
+            self.assertEqual(q.depth(), 0)
 
 
 if __name__ == "__main__":
