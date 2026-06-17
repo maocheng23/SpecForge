@@ -8,9 +8,9 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """SampleRefQueue: a metadata-only queue with lease / ack / fail semantics.
 
-Phase-1 is an in-process implementation; the lease/ack contract is present from
-day one so a durable queue (visibility timeout, replay) can be swapped in later
-without touching callers. Carries no tensors — only ``SampleRef`` metadata.
+The current implementation is in-process; the lease/ack contract is present so a
+durable queue (visibility timeout, replay) can be swapped in later without
+touching callers. Carries no tensors — only ``SampleRef`` metadata.
 """
 
 from __future__ import annotations
@@ -32,8 +32,9 @@ class SampleRefQueue:
         self._cv = threading.Condition(self._lock)
 
     def put(self, refs: List[SampleRef], *, partition_key: Optional[str] = None) -> None:
-        # partition_key reserves the per-DP-rank queue partition seam (queues.md /
-        # M6 reshard). Phase-1 is a single partition, so it is accepted and ignored.
+        # partition_key reserves the per-DP-rank queue partition seam for future
+        # reshard support. Today there is a single partition, so it is accepted
+        # and ignored.
         with self._cv:
             for ref in refs:
                 assert_no_tensors(ref)  # structural no-tensor guard

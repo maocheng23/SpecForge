@@ -8,16 +8,16 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """FeatureStore: the data plane's large-tensor storage and transfer boundary.
 
-``FeatureStore`` is the abstract contract; ``LocalFeatureStore`` is the phase-1
-implementation. Per ADR-0003 the local backend keeps features in memory on the
-hot path, with an *optional* disk/mmap debug dump that doubles as the
-capture/replay tap. It also supports a read-only "existing file" mode so the
+``FeatureStore`` is the abstract contract; ``LocalFeatureStore`` is the local
+implementation. The local backend keeps features in memory on the hot path,
+with an *optional* disk/mmap debug dump that doubles as the capture/replay tap.
+It also supports a read-only "existing file" mode so the
 ``OfflineManifestReader`` can reference precomputed ``.ckpt`` files without
 copying them.
 
-Backends later (shared memory, Mooncake/RDMA) slot in behind the same API; the
-lease/generation/clone-on-fetch primitives are carried here so phase 1 pays
-nothing for them but the contract is already exercised.
+Other backends (shared memory, Mooncake/RDMA) slot in behind the same API; the
+lease/generation/clone-on-fetch primitives are carried here so the in-memory
+backend pays nothing for them but the contract is already exercised.
 """
 
 from __future__ import annotations
@@ -162,7 +162,9 @@ class LocalFeatureStore(FeatureStore):
         staged = {k: v for k, v in tensors.items()}
         specs = {k: spec_from_tensor(k, v) for k, v in staged.items()}
         # Stamp the target feature's representation + vocab-map version onto its
-        # spec so the trainer-side mapping is version-gated (ADR-0001 / pruned_logits).
+        # spec so the trainer-side mapping is version-gated. For pruned_logits the
+        # token-to-draft (t2d) map is applied at rollout, so the version must travel
+        # with the feature.
         target_repr = metadata.get("target_repr")
         target_name = metadata.get("target_feature_name", "target")
         if target_repr and target_name in specs:
@@ -177,7 +179,7 @@ class LocalFeatureStore(FeatureStore):
             gen = self._generation.get(sample_id, 0) + 1
             self._generation[sample_id] = gen
             self._mem[sample_id] = staged
-        if self.dump_dir:  # opt-in capture/replay tap (ADR-0003)
+        if self.dump_dir:  # opt-in capture/replay tap
             self._dump(sample_id, staged)
         ref = SampleRef(
             sample_id=sample_id,
@@ -269,7 +271,7 @@ class LocalFeatureStore(FeatureStore):
             if cur is not None and handle.generation != cur:
                 return  # stale handle -> no-op
             # In-memory backend keeps owning tensors; physical free happens on
-            # abort or GC (M5). Releasing a lease is enough here.
+            # abort or GC. Releasing a lease is enough here.
 
     def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
         with self._lock:

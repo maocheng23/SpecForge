@@ -17,8 +17,8 @@ same ``SampleRefQueue`` so the trainer path has no online/offline branch.
 
 Recovery-critical state (committed-sample dedup and the durable ack transaction)
 lives behind a ``MetadataStore`` so a durable backend (SQLite → Redis/DB) is a
-swap, not a rewrite. Phase 1 is in-process; the public surface already matches
-the durable controller shape so a later Ray/service deployment is mechanical.
+swap, not a rewrite. The current backend is in-process; the public surface already
+matches the durable controller shape so a later Ray/service deployment is mechanical.
 """
 
 from __future__ import annotations
@@ -216,8 +216,8 @@ class DataFlowController:
         """Ack consumed refs at the trainer's optimizer-step boundary.
 
         Records the durable ``{acked sample_ids, global_step, optimizer-durable
-        marker}`` transaction (ADR-0002 B4) *then* releases the queue lease, so
-        restart can derive release state from the single committed marker.
+        marker}`` transaction *then* releases the queue lease, so restart can
+        derive release state from the single committed marker.
         """
         self.store.record_train_ack(
             sample_ids, global_step=global_step, optimizer_durable=optimizer_durable
@@ -236,7 +236,7 @@ class DataFlowController:
         self.sample_queue.fail(refs, reason, retryable)
 
     # NOTE: weight publishing (publish_weight_version / latest_weight_version) is
-    # deferred with the rest of the weight-version lifecycle (M7).
+    # not yet implemented; it lands with the rest of the weight-version lifecycle.
 
     def status(self) -> Dict[str, Any]:
         with self._lock:

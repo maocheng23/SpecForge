@@ -8,11 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
-Phase 1 implements ``FSDPTrainingBackend`` only. It carries a ``ParallelConfig``
+Currently implements ``FSDPTrainingBackend`` only. It carries a ``ParallelConfig``
 object (the device-mesh / parallel-group handles) rather than a bare FSDP
-module, so the existing FSDP + TP + Ulysses/Ring SP setup is preserved exactly
-(the M3 no-regression requirement, and the seam M6 reshard later extends). The
-backend does not re-derive parallelism — it reads the handles SpecForge's
+module, so the existing FSDP + TP + Ulysses/Ring SP setup is preserved exactly.
+The backend does not re-derive parallelism — it reads the handles SpecForge's
 ``init_distributed`` already created.
 
 ``torch`` is imported at module load (fine without a GPU); ``specforge.distributed``
@@ -44,8 +43,8 @@ class ParallelConfig:
     param_dtype: torch.dtype = torch.bfloat16
     # opaque process-group / device-mesh handles (None in single-process).
     # The full set is carried so TP + Ulysses/Ring SP survive the trainer split
-    # (M3 no-regression) and the M6 reshard contract has real handles to read —
-    # the parallelism is NOT re-derived here, only snapshotted from init_distributed.
+    # and a later reshard step has real handles to read — the parallelism is
+    # NOT re-derived here, only snapshotted from init_distributed.
     fsdp_process_group: Any = None
     dp_group: Any = None
     draft_dp_group: Any = None

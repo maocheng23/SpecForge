@@ -113,5 +113,30 @@ class TestFeatureDataLoader(unittest.TestCase):
             self.assertEqual(q.depth(), 0)
 
 
+    def test_refs_mode_is_reiterable_across_epochs(self):
+        # offline: a fixed ref set must re-iterate every epoch (no epoch-drain).
+        with tempfile.TemporaryDirectory() as d:
+            self._write_offline_files(d, n=4)
+            refs = OfflineManifestReader(d, run_id="run").read()
+            loader = FeatureDataLoader(
+                LocalFeatureStore("st"),
+                refs=refs,
+                batch_size=2,
+                collate_fn=_simple_collate,
+                per_sample_transform=_offline_eagle3_process_data,
+            )
+            epoch1 = [b.sample_ids for b in loader]
+            epoch2 = [b.sample_ids for b in loader]
+            self.assertEqual(len(epoch1), 2)
+            self.assertEqual(epoch1, epoch2)  # same fixed set each epoch
+
+    def test_requires_exactly_one_source(self):
+        store = LocalFeatureStore("st")
+        with self.assertRaises(ValueError):
+            FeatureDataLoader(store)  # neither queue nor refs
+        with self.assertRaises(ValueError):
+            FeatureDataLoader(store, SampleRefQueue(), refs=[])  # both
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

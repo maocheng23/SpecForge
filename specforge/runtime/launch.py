@@ -8,7 +8,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Launch helpers that wire the DataFlow runtime from a RunConfig.
 
-The training *script* becomes a thin launcher (M3): it parses args, calls one of
+The training *script* becomes a thin launcher: it parses args, calls one of
 these builders, and runs ``TrainerController.fit``. All training logic lives in
 the runtime components, not the script. This module wires the **offline EAGLE3**
 path end to end:
@@ -18,7 +18,7 @@ path end to end:
         -> TrainBatch -> Eagle3TrainStrategy -> TrainerCore/Controller -> FSDP
 
 Online wiring (RolloutWorker + SGLangAdapter) composes the same control/data
-plane; see ``inference/`` and the M2 test for the equivalent assembly.
+plane; see ``inference/`` for the equivalent assembly.
 """
 
 from __future__ import annotations
@@ -67,30 +67,26 @@ def build_offline_eagle3_runtime(
     from specforge.data.utils import DataCollatorWithPadding
 
     controller = DataFlowController(run_id)
-    controller.enqueue_offline_refs(
-        OfflineManifestReader(
-            hidden_states_path,
-            run_id=run_id,
-            ttt_length=ttt_length,
-            max_len=max_len,
-            target_repr="hidden_state",
-        ).read()
-    )
+    refs = OfflineManifestReader(
+        hidden_states_path,
+        run_id=run_id,
+        ttt_length=ttt_length,
+        max_len=max_len,
+        target_repr="hidden_state",
+    ).read()
+    controller.enqueue_offline_refs(refs)  # record committed state (enables ack lookup)
     store = LocalFeatureStore(run_id)
-    # Lease + ack go through the controller (durable ack transaction; cross-node
-    # ready) rather than the raw queue. The trainer owns the ack at the
-    # optimizer-step boundary, so the loader does not ack.
     trainer_id = controller.register_trainer({"role": "trainer", "run_id": run_id})
-    lease = controller.train_lease(trainer_id)
+    # Offline = a fixed, re-iterable ref set (so num_epochs > 1 actually trains
+    # multiple epochs). The trainer acks at the optimizer-step boundary via ack_fn.
     loader = FeatureDataLoader(
         store,
-        lease,
+        refs=refs,
         batch_size=batch_size,
         collate_fn=DataCollatorWithPadding(),
         per_sample_transform=lambda raw: OfflineEagle3Dataset.process_data(raw, max_len),
         drop_last=True,
         strategy="eagle3",
-        ack=False,
     )
 
     parallel = ParallelConfig.from_distributed(

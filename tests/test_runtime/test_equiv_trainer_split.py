@@ -102,11 +102,11 @@ class TestEquivTrainerSplit(unittest.TestCase):
         )
         rep = core.train_step(batch)
 
-        self.assertAlmostEqual(loss_old, rep["loss"], places=4,
-                               msg=f"loss: old={loss_old} new={rep['loss']}")
+        self.assertAlmostEqual(loss_old, rep.loss, places=4,
+                               msg=f"loss: old={loss_old} new={rep.loss}")
         self.assertAlmostEqual(
-            float(gn_old.item()), rep["grad_norm"], places=3,
-            msg=f"grad_norm: old={gn_old.item()} new={rep['grad_norm']}",
+            float(gn_old.item()), rep.grad_norm, places=3,
+            msg=f"grad_norm: old={gn_old.item()} new={rep.grad_norm}",
         )
 
 

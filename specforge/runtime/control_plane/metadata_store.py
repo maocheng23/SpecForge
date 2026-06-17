@@ -8,14 +8,13 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """MetadataStore: the durability seam for recovery-critical control-plane state.
 
-The controller's *recovery-critical* state — committed sample dedup, the
+The controller's *recovery-critical* state — committed sample dedup and the
 at-least-once durable ack transaction (``{acked sample_ids, global_step,
-optimizer-durable marker}`` from ADR-0002 / failure_recovery.md B4) — lives
-behind this interface rather than in inline dicts. Phase 1 ships
-``InMemoryMetadataStore``; a SQLite (dev) or Redis/DB (prod) backend is then a
-*new subclass*, not a method-by-method rewrite of the controller. The single
-durable transaction (``record_train_ack``) is the unit a restart reconciles
-release state from.
+optimizer-durable marker}``) — lives behind this interface rather than in inline
+dicts. The current implementation ships ``InMemoryMetadataStore``; a SQLite
+(dev) or Redis/DB (prod) backend is then a *new subclass*, not a
+method-by-method rewrite of the controller. The single durable transaction
+(``record_train_ack``) is the unit a restart reconciles release state from.
 
 Dependency-light (stdlib only) so it stays importable without torch.
 """
@@ -44,7 +43,7 @@ class MetadataStore(abc.ABC):
     @abc.abstractmethod
     def committed_count(self) -> int: ...
 
-    # -- durable ack transaction (ADR-0002 B4) -----------------------------
+    # -- durable ack transaction -------------------------------------------
     @abc.abstractmethod
     def record_train_ack(
         self, sample_ids: List[str], *, global_step: Optional[int], optimizer_durable: bool
@@ -52,15 +51,15 @@ class MetadataStore(abc.ABC):
         """Commit {acked sample_ids, global_step, optimizer-durable marker} atomically.
 
         Release state is *derived* from this on restart — it is the single
-        transaction failure_recovery.md reconciles against; never split it.
+        transaction recovery reconciles against; never split it.
         """
 
     @abc.abstractmethod
     def durable_marker(self) -> Dict[str, Any]:
         """{acked: set[str], global_step: int|None, optimizer_durable: bool}."""
 
-    # NOTE: weight-version registry (put/latest/count) is deferred with the rest
-    # of the published-weight lifecycle (M7).
+    # NOTE: a weight-version registry (put/latest/count) is not yet implemented;
+    # it belongs with the rest of the published-weight lifecycle.
 
 
 class InMemoryMetadataStore(MetadataStore):

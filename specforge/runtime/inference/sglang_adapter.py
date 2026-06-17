@@ -6,7 +6,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""SGLangAdapter: the clean boundary between SpecForge and the target engine (M4).
+"""SGLangAdapter: the clean boundary between SpecForge and the target engine.
 
 ``generate_features(tasks, *, capture)`` is the single extraction entry point.
 ``capture`` is the typed :class:`CaptureConfig` derived from the active strategy,
@@ -68,13 +68,23 @@ class SGLangAdapter:
         ids = getattr(self.target_model, "aux_hidden_states_layers", None)
         return tuple(ids) if ids is not None else ()
 
+    # target representations this online adapter actually implements
+    SUPPORTED_TARGET_REPRS = ("logits", "pruned_logits")
+
     def _project_target(self, target: torch.Tensor, capture: CaptureConfig) -> torch.Tensor:
+        if capture.target_repr == "logits":
+            return target
         if capture.target_repr == "pruned_logits":
             if self.t2d is None:
                 raise ValueError("pruned_logits capture requires a t2d vocab map")
             return target[..., self.t2d.to(target.device)]
-        # logits / hidden_state: store what the engine produced
-        return target
+        # Only advertise what we implement. 'hidden_state' capture (storing the
+        # target's last hidden state) is not wired in the online adapter yet; the
+        # offline path supports it (the strategy re-runs TargetHead).
+        raise NotImplementedError(
+            f"SGLangAdapter does not implement online capture for target_repr="
+            f"{capture.target_repr!r}; supported: {self.SUPPORTED_TARGET_REPRS}"
+        )
 
     def generate_features(
         self, tasks: List[PromptTask], *, capture: CaptureConfig
@@ -129,7 +139,7 @@ class SGLangAdapter:
                 }
         return out
 
-    # NOTE: draft-weight hot update (update_draft_weights) is deferred to M7.
+    # NOTE: draft-weight hot update (update_draft_weights) is not implemented yet.
 
     def health(self) -> Dict[str, Any]:
         return {

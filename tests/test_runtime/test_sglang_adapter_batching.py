@@ -65,6 +65,19 @@ class TestAdapterBatching(unittest.TestCase):
             self.assertEqual(f["__aux_layer_ids__"], (1, 2, 3))
             self.assertEqual(f["target"].shape[-1], V)
 
+    def test_rejects_unimplemented_target_repr(self):
+        # the online adapter must only advertise reprs it implements
+        adapter = SGLangAdapter(FakeTarget(), device="cpu")
+        cap = CaptureConfig.from_strategy(
+            required_features={"input_ids", "attention_mask", "loss_mask", "hidden_state", "target"},
+            aux_hidden_state_layer_ids=(1, 2, 3),
+            target_repr="hidden_state",  # not implemented online
+            target_hidden_size=H, target_vocab_size=V,
+        )
+        task = PromptTask("t0", "r", "s", {"input_ids": [1, 2, 3, 4]}, 4)
+        with self.assertRaises(NotImplementedError):
+            adapter.generate_features([task], capture=cap)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

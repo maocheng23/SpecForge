@@ -35,7 +35,7 @@ SCHEMA_VERSION = 1
 RunMode = Literal["online", "offline"]
 DeploymentMode = Literal["local_colocated", "dataflow_colocated", "disaggregated"]
 DraftStrategyName = Literal["eagle3", "dflash"]
-# Tagged union for the EAGLE3 target feature (ADR-0001). The *strategy* owns the
+# Tagged union for the EAGLE3 target feature. The *strategy* owns the
 # projection so the trainer core stays branch-free:
 #   - pruned_logits: rollout applied the t2d vocab map; stored (seq, draft_vocab)
 #   - logits:        full (seq, target_vocab); parity/debug only
@@ -131,8 +131,8 @@ class TrainBatch:
 
 
 # NOTE: the published-weight lifecycle (WeightVersion, WeightPublisher, hot
-# update, serving accept-length gate) is intentionally deferred to M7 — it is not
-# needed for the M1–M4 local train pipeline. SampleRef/PromptTask still carry a
+# update, serving accept-length gate) is not implemented here — it is not needed
+# for the local train pipeline. SampleRef/PromptTask still carry a
 # ``draft_weight_version`` *string* as rollout provenance, but there is no
 # WeightVersion object or publisher here yet.
 

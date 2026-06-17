@@ -9,8 +9,8 @@
 """RolloutWorker: PromptTask -> features -> FeatureStore -> SampleRef commit.
 
 The worker is deliberately small and strategy-agnostic: it leases prompt tasks,
-asks a ``feature_source`` (M2: a wrapper over the target model's
-``generate_eagle3_data``; M4: ``SGLangAdapter``) for per-sample features,
+asks a ``feature_source`` (e.g. a wrapper over the target model's
+``generate_eagle3_data``, or ``SGLangAdapter``) for per-sample features,
 verifies them against the typed ``CaptureConfig`` *before* writing, writes them
 to the ``FeatureStore``, and commits the resulting ``SampleRef`` metadata to the
 controller. It never hands a tensor to the controller. Strategy-specific capture
@@ -180,7 +180,7 @@ class RolloutWorker:
         """Stop leasing new work; in-flight is finished by the active run_once."""
         self._state = "draining"
 
-    # NOTE: draft-weight hot update (update_weights -> adapter) is deferred to M7.
+    # Draft-weight hot update (update_weights -> adapter) is not yet supported.
     # draft_weight_version is still recorded as rollout provenance on each sample.
 
     def health(self) -> Dict[str, Any]:

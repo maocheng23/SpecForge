@@ -40,7 +40,6 @@ class CaptureConfig:
     target_vocab_size: Optional[int] = None
     draft_vocab_size: Optional[int] = None
     vocab_map_version: Optional[str] = None
-    capture_last_hidden: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -54,7 +53,6 @@ class CaptureConfig:
         target_vocab_size: Optional[int] = None,
         draft_vocab_size: Optional[int] = None,
         vocab_map_version: Optional[str] = None,
-        capture_last_hidden: bool = False,
     ) -> "CaptureConfig":
         return cls(
             feature_names=frozenset(required_features),
@@ -64,7 +62,6 @@ class CaptureConfig:
             target_vocab_size=target_vocab_size,
             draft_vocab_size=draft_vocab_size,
             vocab_map_version=vocab_map_version,
-            capture_last_hidden=capture_last_hidden,
         )
 
     @property

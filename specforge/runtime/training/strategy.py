@@ -12,7 +12,7 @@ A strategy is the only place that knows how a particular draft model
 (EAGLE3 / DFlash) turns a normalized ``TrainBatch`` into a loss. The
 ``TrainerCore`` stays branch-free: it never inspects ``target_repr`` or branches
 on online/offline — the strategy owns the target projection (applying
-``TargetHead`` / the ``t2d`` vocab map) exactly where ADR-0001 places it.
+``TargetHead`` / the ``t2d`` vocab map).
 
 This module imports the SpecForge model code, so it is imported by training
 entry points, not at ``specforge.runtime`` package load.
@@ -70,7 +70,7 @@ class DraftTrainStrategy(abc.ABC):
 class Eagle3TrainStrategy(DraftTrainStrategy):
     """EAGLE3 TTT strategy wrapping the existing ``OnlineEagle3Model``.
 
-    Projection ownership (ADR-0001): for ``target_repr == "hidden_state"`` the
+    Projection ownership: for ``target_repr == "hidden_state"`` the
     strategy re-runs the frozen ``TargetHead`` (lm_head) over the stored target
     last hidden state — exactly today's offline ``run_forward``. For
     ``logits`` / ``pruned_logits`` the rollout already produced the distribution

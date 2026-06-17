@@ -44,8 +44,9 @@ class FeatureDataLoader:
     def __init__(
         self,
         store: FeatureStore,
-        queue: SampleRefQueue,
+        queue: Optional[SampleRefQueue] = None,
         *,
+        refs: Optional[List[SampleRef]] = None,
         batch_size: int = 1,
         collate_fn: Optional[CollateFn] = None,
         per_sample_transform: Optional[PerSampleTransform] = None,
@@ -55,8 +56,15 @@ class FeatureDataLoader:
         strategy: str = "eagle3",
         ack: bool = True,
     ) -> None:
+        # Two iteration modes, reflecting that online and offline differ in
+        # *iteration* even though they converge at SampleRef:
+        #   - queue: a consume-once stream (online rollout produces over time)
+        #   - refs:  a fixed set, re-iterable across epochs (offline manifest)
+        if (queue is None) == (refs is None):
+            raise ValueError("provide exactly one of `queue` (stream) or `refs` (re-iterable)")
         self.store = store
         self.queue = queue
+        self._refs = list(refs) if refs is not None else None
         self.batch_size = batch_size
         self.collate_fn = collate_fn or _default_collate
         self.per_sample_transform = per_sample_transform
@@ -111,7 +119,43 @@ class FeatureDataLoader:
             tensors = self.per_sample_transform(tensors)
         return tensors
 
+    def _make_batch(self, refs: List[SampleRef]) -> TrainBatch:
+        self._validate_refs(refs)
+        per_sample = [self._materialize(r) for r in refs]
+        batch_tensors = self.collate_fn(per_sample)
+        non_tensors = [
+            name
+            for name, value in batch_tensors.items()
+            if not isinstance(value, torch.Tensor)
+        ]
+        if non_tensors:
+            raise TypeError(f"collate_fn returned non-tensors for {non_tensors}")
+        return TrainBatch(
+            sample_ids=[r.sample_id for r in refs],
+            strategy=self.strategy,
+            tensors=batch_tensors,
+            metadata={
+                "target_repr": refs[0].metadata.get("target_repr"),
+                "ttt_length": refs[0].metadata.get("ttt_length"),
+            },
+        )
+
     def __iter__(self) -> Iterator[TrainBatch]:
+        if self._refs is not None:
+            yield from self._iter_refs()
+        else:
+            yield from self._iter_queue()
+
+    def _iter_refs(self) -> Iterator[TrainBatch]:
+        # Offline: a fixed ref set, re-iterable every epoch. Acking (durable
+        # marker) is the trainer's job via its ack callback, not the loader's.
+        for start in range(0, len(self._refs), self.batch_size):
+            chunk = self._refs[start : start + self.batch_size]
+            if self.drop_last and len(chunk) < self.batch_size:
+                break
+            yield self._make_batch(chunk)
+
+    def _iter_queue(self) -> Iterator[TrainBatch]:
         while True:
             refs = self.queue.get(self.batch_size, timeout_s=0.0)
             if not refs:
@@ -122,31 +166,17 @@ class FeatureDataLoader:
                 self.queue.fail(refs, reason="drop_last", retryable=True)
                 return
             try:
-                self._validate_refs(refs)
-                per_sample = [self._materialize(r) for r in refs]
-                batch_tensors = self.collate_fn(per_sample)
-                non_tensors = [
-                    name
-                    for name, value in batch_tensors.items()
-                    if not isinstance(value, torch.Tensor)
-                ]
-                if non_tensors:
-                    raise TypeError(f"collate_fn returned non-tensors for {non_tensors}")
+                batch = self._make_batch(refs)
             except Exception as exc:
                 self.queue.fail(refs, reason=f"materialize:{exc}", retryable=False)
                 raise
-            batch = TrainBatch(
-                sample_ids=[r.sample_id for r in refs],
-                strategy=self.strategy,
-                tensors=batch_tensors,
-                metadata={
-                    "target_repr": refs[0].metadata.get("target_repr"),
-                    "ttt_length": refs[0].metadata.get("ttt_length"),
-                },
-            )
             yield batch
             if self.ack:
                 self.queue.ack(refs)
+
+    def set_epoch(self, epoch: int) -> None:
+        # hook for per-epoch shuffling of the offline ref set (no-op for now)
+        self._epoch = epoch
 
     def close(self) -> None:
         pass

@@ -146,9 +146,9 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
             metadata={},
         )
         rep = core.train_step(batch)
-        self.assertIn("grad_norm", rep)  # optimizer stepped via the shared core
+        self.assertTrue(rep.optimizer_stepped)  # optimizer stepped via the shared core
         self.assertEqual(backend.steps, 1)
-        self.assertAlmostEqual(rep["acc"], 0.5)
+        self.assertAlmostEqual(rep.metrics["acc"], 0.5)
 
     def test_dflash_validate_batch_rejects_missing(self):
         strat = DFlashTrainStrategy(_FakeDFlashModel())

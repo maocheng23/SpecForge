@@ -71,10 +71,12 @@ class TestTrainerCore(unittest.TestCase):
         backend = FakeBackend(strat.model)
         core = TrainerCore(strat, backend, accumulation_steps=2)
         m0 = core.train_step(_batch())
-        self.assertNotIn("grad_norm", m0)  # no optimizer step yet
+        self.assertFalse(m0.optimizer_stepped)  # no optimizer step yet
+        self.assertIsNone(m0.grad_norm)
         self.assertEqual(backend.steps, 0)
         m1 = core.train_step(_batch())
-        self.assertIn("grad_norm", m1)  # step on the 2nd micro-batch
+        self.assertTrue(m1.optimizer_stepped)  # step on the 2nd micro-batch
+        self.assertIsNotNone(m1.grad_norm)
         self.assertEqual(backend.steps, 1)
         self.assertEqual(backend.backwards, 2)
 
