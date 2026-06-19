@@ -68,6 +68,24 @@ except Exception as _exc:  # pragma: no cover - depends on installed sglang vers
 logger = logging.getLogger(__name__)
 
 
+def _require_sglang() -> None:
+    """Raise a clear error if the SGLang target backend is unusable.
+
+    The sglang imports above are optional so that `import specforge` and the
+    HF / offline / draft paths work without a version-matched sglang. The SGLang
+    backend genuinely needs them, so fail loudly here instead of letting a
+    later `NoneType` access produce an opaque error.
+    """
+    if _SGLANG_IMPORT_ERROR is not None:
+        raise ImportError(
+            "The SGLang target backend requires a compatible sglang install, "
+            "but importing sglang internals failed. Install/upgrade sglang to a "
+            "version compatible with this SpecForge release, or use a different "
+            "backend (e.g. backend='hf'). Original import error: "
+            f"{_SGLANG_IMPORT_ERROR!r}"
+        ) from _SGLANG_IMPORT_ERROR
+
+
 @dataclass
 class Eagle3TargetOutput:
     hidden_states: torch.Tensor
@@ -291,6 +309,7 @@ class HFEagle3TargetModel(Eagle3TargetModel):
 class SGLangEagle3TargetModel(Eagle3TargetModel):
 
     def __init__(self, model_runner: SGLangRunner, hf_config=None):
+        _require_sglang()
         super().__init__()
         self.model_runner = model_runner
         self.hf_config = hf_config
@@ -337,6 +356,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "SGLangEagle3TargetModel":
+        _require_sglang()
         tp_size = dist.get_world_size(get_tp_group())
         # NOTE: sglang 0.5.9 requires dtype to be non-None
         # If torch_dtype is None, use "auto" to let sglang decide the dtype
