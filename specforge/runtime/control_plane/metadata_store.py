@@ -28,7 +28,7 @@ import sqlite3
 import threading
 from typing import Any, Dict, List, Optional, Set
 
-from specforge.runtime.contracts import FeatureSpec, SampleRef
+from specforge.runtime.contracts import FeatureSpec, SampleRef, WeightVersion
 
 
 class MetadataStore(abc.ABC):
@@ -80,6 +80,8 @@ class InMemoryMetadataStore(MetadataStore):
         self._acked: Set[str] = set()
         self._global_step: Optional[int] = None
         self._optimizer_durable: bool = False
+        self._weights: Dict[str, WeightVersion] = {}
+        self._weight_order: List[str] = []
 
     def commit_sample(self, ref: SampleRef) -> bool:
         with self._lock:
@@ -126,9 +128,28 @@ class InMemoryMetadataStore(MetadataStore):
                 "optimizer_durable": self._optimizer_durable,
             }
 
+    # -- weight-version registry (M7) --------------------------------------
+    def put_weight_version(self, wv: WeightVersion) -> None:
+        with self._lock:
+            if wv.version_id not in self._weights:
+                self._weight_order.append(wv.version_id)
+            self._weights[wv.version_id] = wv  # upsert (status/metric updates)
+
+    def get_weight_version(self, version_id: str) -> Optional[WeightVersion]:
+        with self._lock:
+            return self._weights.get(version_id)
+
+    def all_weight_versions(self) -> List[WeightVersion]:
+        with self._lock:
+            return [self._weights[v] for v in self._weight_order]
+
+    def latest_weight_version(self) -> Optional[WeightVersion]:
+        with self._lock:
+            return self._weights[self._weight_order[-1]] if self._weight_order else None
+
 
 # ---------------------------------------------------------------------------
-# SampleRef <-> JSON (the only metadata-store payload that needs persisting)
+# Record <-> JSON (the metadata-store payloads that need persisting)
 # ---------------------------------------------------------------------------
 def sample_ref_to_json(ref: SampleRef) -> str:
     # asdict() recurses into the nested FeatureSpec dataclasses + dicts; tuples
@@ -168,6 +189,25 @@ def sample_ref_from_json(blob: str) -> SampleRef:
     )
 
 
+def weight_version_to_json(wv: WeightVersion) -> str:
+    return json.dumps(dataclasses.asdict(wv))
+
+
+def weight_version_from_json(blob: str) -> WeightVersion:
+    d = json.loads(blob)
+    return WeightVersion(
+        version_id=d["version_id"],
+        draft_weight_version=d["draft_weight_version"],
+        target_model_version=d["target_model_version"],
+        global_step=d["global_step"],
+        checkpoint_uri=d.get("checkpoint_uri"),
+        parent_version_id=d.get("parent_version_id"),
+        status=d.get("status", "candidate"),
+        metrics=d.get("metrics", {}),
+        metadata=d.get("metadata", {}),
+    )
+
+
 class SQLiteMetadataStore(MetadataStore):
     """Durable metadata store: committed refs + the single ack transaction.
 
@@ -199,6 +239,11 @@ class SQLiteMetadataStore(MetadataStore):
             )
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS marker (k TEXT PRIMARY KEY, v TEXT)"
+            )
+            # weight-version registry: seq preserves publish order for staleness.
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS weight_versions ("
+                "version_id TEXT PRIMARY KEY, seq INTEGER, wv_json TEXT NOT NULL)"
             )
             self._conn.commit()
 
@@ -274,6 +319,48 @@ class SQLiteMetadataStore(MetadataStore):
         )
         return {"acked": acked, "global_step": gs, "optimizer_durable": od}
 
+    # -- weight-version registry (M7) --------------------------------------
+    def put_weight_version(self, wv: WeightVersion) -> None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT seq FROM weight_versions WHERE version_id = ?", (wv.version_id,)
+            ).fetchone()
+            if row is None:  # new version -> append at next seq
+                seq = (
+                    self._conn.execute(
+                        "SELECT COALESCE(MAX(seq), -1) + 1 FROM weight_versions"
+                    ).fetchone()[0]
+                )
+            else:  # upsert keeps publish order (status/metric updates)
+                seq = row[0]
+            self._conn.execute(
+                "INSERT OR REPLACE INTO weight_versions (version_id, seq, wv_json) "
+                "VALUES (?, ?, ?)",
+                (wv.version_id, seq, weight_version_to_json(wv)),
+            )
+            self._conn.commit()
+
+    def get_weight_version(self, version_id: str) -> Optional[WeightVersion]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT wv_json FROM weight_versions WHERE version_id = ?", (version_id,)
+            ).fetchone()
+        return weight_version_from_json(row[0]) if row else None
+
+    def all_weight_versions(self) -> List[WeightVersion]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT wv_json FROM weight_versions ORDER BY seq ASC"
+            ).fetchall()
+        return [weight_version_from_json(r[0]) for r in rows]
+
+    def latest_weight_version(self) -> Optional[WeightVersion]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT wv_json FROM weight_versions ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
+        return weight_version_from_json(row[0]) if row else None
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -285,4 +372,6 @@ __all__ = [
     "SQLiteMetadataStore",
     "sample_ref_to_json",
     "sample_ref_from_json",
+    "weight_version_to_json",
+    "weight_version_from_json",
 ]

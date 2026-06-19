@@ -29,11 +29,21 @@ import uuid
 from collections import OrderedDict, deque
 from typing import Any, Deque, Dict, List, Optional
 
-from specforge.runtime.contracts import PromptTask, SampleRef, assert_no_tensors
+from specforge.runtime.contracts import (
+    PromptTask,
+    SampleRef,
+    WeightVersion,
+    assert_no_tensors,
+)
 from specforge.runtime.control_plane.backpressure import BackpressureController
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
+)
+from specforge.runtime.control_plane.version_policy import (
+    PublishResult,
+    WeightPublisher,
+    WeightRegistry,
 )
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 
@@ -90,6 +100,8 @@ class DataFlowController:
         # behavior). The controller owns the pause decision; the policy only
         # reads capacity (FeatureStore.health) — no tensors cross this seam.
         self.backpressure = backpressure
+        # Published-weight registry (M7), durable through the same metadata store.
+        self.weight_registry = WeightRegistry(self.store)
         self._prompts: "OrderedDict[str, PromptTask]" = OrderedDict()
         self._prompt_pending: Deque[str] = deque()
         self._prompt_leased: Dict[str, str] = {}  # task_id -> worker_id
@@ -314,8 +326,25 @@ class DataFlowController:
             "optimizer_durable": marker["optimizer_durable"],
         }
 
-    # NOTE: weight publishing (publish_weight_version / latest_weight_version) is
-    # not yet implemented; it lands with the rest of the weight-version lifecycle.
+    # -- published-weight lifecycle (M7) ----------------------------------
+    def publish_weight_version(
+        self, version: WeightVersion, rollouts: Optional[List[Any]] = None
+    ) -> PublishResult:
+        """Publish a draft-weight version and hot-update the rollout pool.
+
+        Metadata only: the weights live at ``version.checkpoint_uri``; the
+        controller records the version (durably, via the metadata store) and
+        drives the pool's hot update, activating only once the pool acks.
+        """
+        assert_no_tensors(version)
+        publisher = WeightPublisher(self.weight_registry)
+        return publisher.publish(version, rollouts or [])
+
+    def latest_weight_version(self) -> Optional[WeightVersion]:
+        return self.weight_registry.latest()
+
+    def active_weight_version(self) -> Optional[WeightVersion]:
+        return self.weight_registry.active()
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
