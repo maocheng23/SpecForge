@@ -47,6 +47,53 @@ class TestLocalFeatureStore(unittest.TestCase):
         self.assertIn("x", out)
         _ = h2
 
+    def test_release_frees_mem_on_last_lease(self):
+        # mem:// is consume-once: the last release must physically free tensors,
+        # otherwise an online put->get->release loop grows _mem unboundedly.
+        store = LocalFeatureStore("st")
+        ref = store.put({"x": torch.randn(1, 4)}, sample_id="s0", metadata={})
+        self.assertEqual(store.health()["resident_samples"], 1)
+        _, h = store.get(ref)
+        store.release(h)
+        self.assertEqual(store.health()["resident_samples"], 0)
+        self.assertEqual(store.health()["resident_bytes"], 0)
+        with self.assertRaises(KeyError):
+            store.get(ref)  # consumed -> gone
+
+    def test_release_keeps_mem_while_other_lease_active(self):
+        # refcount: only the LAST lease frees the sample.
+        store = LocalFeatureStore("st")
+        ref = store.put({"x": torch.randn(1, 4)}, sample_id="s0", metadata={})
+        _, h1 = store.get(ref)
+        _, h2 = store.get(ref)
+        store.release(h1)
+        self.assertEqual(store.health()["resident_samples"], 1)  # h2 still holds it
+        store.release(h2)
+        self.assertEqual(store.health()["resident_samples"], 0)  # last lease -> freed
+
+    def test_online_put_get_release_loop_is_bounded(self):
+        # The regression this fix targets: many unique samples, consumed and
+        # released, must not accumulate in the store.
+        store = LocalFeatureStore("st")
+        for i in range(50):
+            ref = store.put({"x": torch.randn(1, 8)}, sample_id=f"s{i}", metadata={})
+            _, h = store.get(ref)
+            store.release(h)
+        self.assertEqual(store.health()["resident_samples"], 0)
+        self.assertEqual(store.health()["resident_bytes"], 0)
+
+    def test_max_resident_bytes_raises_when_consumer_is_behind(self):
+        # one float32 (1,8) sample = 32 bytes; cap at 40 admits one, rejects two.
+        store = LocalFeatureStore("st", max_resident_bytes=40)
+        ref0 = store.put({"x": torch.zeros(1, 8, dtype=torch.float32)}, sample_id="s0", metadata={})
+        with self.assertRaises(MemoryError):
+            store.put({"x": torch.zeros(1, 8, dtype=torch.float32)}, sample_id="s1", metadata={})
+        # once the first is consumed+released, there is room for the next
+        _, h = store.get(ref0)
+        store.release(h)
+        store.put({"x": torch.zeros(1, 8, dtype=torch.float32)}, sample_id="s1", metadata={})
+        self.assertEqual(store.health()["resident_samples"], 1)
+
     def test_abort_evicts(self):
         store = LocalFeatureStore("st")
         ref = store.put({"x": torch.randn(1, 4)}, sample_id="s0", metadata={})

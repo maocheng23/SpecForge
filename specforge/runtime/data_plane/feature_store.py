@@ -133,19 +133,34 @@ class LocalFeatureStore(FeatureStore):
         *,
         dump_dir: Optional[str] = None,
         clone_on_get: bool = False,
+        max_resident_bytes: Optional[int] = None,
     ) -> None:
         self.store_id = store_id or uuid.uuid4().hex[:8]
         self.dump_dir = dump_dir
         # When True the store itself clones on get(); normally the *loader* owns
         # the clone policy (clone-on-fetch default lives there), so this is off.
         self.clone_on_get = clone_on_get
+        # Optional cap on mem:// residency. None = unbounded. When set, put()
+        # raises loudly once exceeded — a defined failure instead of silent OOM.
+        self.max_resident_bytes = max_resident_bytes
         self._mem: Dict[str, Dict[str, torch.Tensor]] = {}
         self._generation: Dict[str, int] = {}
         self._active_leases: Dict[str, FeatureHandle] = {}
         self._lock = threading.RLock()
         self._counter = itertools.count()
+        # Global monotonic generation: a re-put never reuses a prior generation,
+        # so a stale handle can never alias freshly stored data. This lets
+        # release() drop the _generation entry too (bounding metadata growth).
+        self._gen_counter = itertools.count(1)
         if dump_dir:
             os.makedirs(dump_dir, exist_ok=True)
+
+    def _resident_bytes_locked(self) -> int:
+        return sum(
+            t.numel() * t.element_size()
+            for feats in self._mem.values()
+            for t in feats.values()
+        )
 
     # -- write -------------------------------------------------------------
     def put(
@@ -176,7 +191,17 @@ class LocalFeatureStore(FeatureStore):
             )
         num_tokens = int(metadata.get("num_tokens", 0))
         with self._lock:
-            gen = self._generation.get(sample_id, 0) + 1
+            if self.max_resident_bytes is not None:
+                projected = self._resident_bytes_locked() + sum(
+                    t.numel() * t.element_size() for t in staged.values()
+                )
+                if projected > self.max_resident_bytes:
+                    raise MemoryError(
+                        f"feature store {self.store_id} over budget: "
+                        f"{projected} > {self.max_resident_bytes} bytes "
+                        f"(resident_samples={len(self._mem)}); consumer is behind"
+                    )
+            gen = next(self._gen_counter)
             self._generation[sample_id] = gen
             self._mem[sample_id] = staged
         if self.dump_dir:  # opt-in capture/replay tap
@@ -264,14 +289,24 @@ class LocalFeatureStore(FeatureStore):
 
     # -- lifetime ----------------------------------------------------------
     def release(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
-        # Idempotent + safe against re-leased samples: a stale generation no-ops.
+        # mem:// samples are consume-once: when the LAST lease on the current
+        # generation is released, free the tensors. This is what bounds online
+        # residency — release() owns physical free here, so the consumer never
+        # needs to know the backend's memory policy. file:// samples never enter
+        # _mem, so the pops below are harmless no-ops and offline ref sets stay
+        # re-iterable across epochs. Idempotent + stale-generation safe.
         with self._lock:
             self._active_leases.pop(handle.lease_token, None)
             cur = self._generation.get(handle.sample_id)
             if cur is not None and handle.generation != cur:
-                return  # stale handle -> no-op
-            # In-memory backend keeps owning tensors; physical free happens on
-            # abort or GC. Releasing a lease is enough here.
+                return  # stale handle (sample was re-put) -> no-op
+            still_leased = any(
+                h.sample_id == handle.sample_id
+                for h in self._active_leases.values()
+            )
+            if not still_leased:
+                self._mem.pop(handle.sample_id, None)
+                self._generation.pop(handle.sample_id, None)
 
     def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
         with self._lock:
@@ -280,16 +315,12 @@ class LocalFeatureStore(FeatureStore):
 
     def health(self) -> Dict[str, Any]:
         with self._lock:
-            resident_bytes = sum(
-                t.numel() * t.element_size()
-                for feats in self._mem.values()
-                for t in feats.values()
-            )
             return {
                 "store_id": self.store_id,
                 "resident_samples": len(self._mem),
                 "active_leases": len(self._active_leases),
-                "resident_bytes": resident_bytes,
+                "resident_bytes": self._resident_bytes_locked(),
+                "max_resident_bytes": self.max_resident_bytes,
             }
 
 
