@@ -82,6 +82,13 @@ class RolloutWorker:
         return f"{self.run_id}:{task.task_id}"
 
     def run_once(self, max_tasks: int) -> List[SampleRef]:
+        """Lease up to ``max_tasks``, extract + persist features, commit refs.
+
+        Every leased task ends in exactly one terminal controller action:
+        ``commit_samples`` (success) or ``fail_prompt_tasks`` (any failure). A
+        single capture mismatch still commits the batch's good samples, then
+        re-raises so the driver sees the worker went unhealthy.
+        """
         if self._state in ("stopped", "draining"):
             return []
         tasks = self.controller.lease_prompt_tasks(self.worker_id, max_tasks)
@@ -90,33 +97,62 @@ class RolloutWorker:
         self._inflight = len(tasks)
         self._state = "ready"
         try:
+            feats_list = self._generate_or_fail(tasks)
+            refs, capture_error = self._persist(tasks, feats_list)
+            if refs:
+                self.controller.commit_samples(self.worker_id, refs)
+                self._last_commit_count += len(refs)
+            if capture_error is not None:
+                self._state = "unhealthy"
+                raise capture_error
+            return refs
+        finally:
+            self._inflight = 0
+
+    def _fail(
+        self,
+        task_ids: List[str],
+        reason: str,
+        *,
+        retryable: bool,
+        fatal: bool = False,
+    ) -> None:
+        """Single terminal failure path: record it, optionally go unhealthy,
+        release the prompt leases (requeued iff ``retryable``)."""
+        self._recent_failures.append(reason)
+        if fatal:
+            self._state = "unhealthy"
+        self.controller.fail_prompt_tasks(
+            self.worker_id, task_ids, reason=reason, retryable=retryable
+        )
+
+    def _generate_or_fail(self, tasks: List[PromptTask]) -> List[Dict[str, Any]]:
+        """Run the (batched) feature source and enforce the 1-record-per-task
+        contract. Both failures are batch-fatal: fail every lease, then raise."""
+        task_ids = [t.task_id for t in tasks]
+        try:
             feats_list = self.feature_source.generate_features(
                 tasks, capture=self.capture
             )
         except Exception as exc:  # rollout failure before any feature write
-            self._state = "unhealthy"
-            self._recent_failures.append(f"generate_features: {exc}")
-            self.controller.fail_prompt_tasks(
-                self.worker_id,
-                [t.task_id for t in tasks],
-                reason=f"generate_features:{exc}",
-                retryable=True,
-            )
-            self._inflight = 0
+            self._fail(task_ids, f"generate_features: {exc}", retryable=True, fatal=True)
             raise
         if len(feats_list) != len(tasks):
             reason = (
                 f"generate_features returned {len(feats_list)} feature records "
                 f"for {len(tasks)} tasks"
             )
-            self._state = "unhealthy"
-            self._recent_failures.append(reason)
-            self.controller.fail_prompt_tasks(
-                self.worker_id, [t.task_id for t in tasks], reason=reason, retryable=False
-            )
-            self._inflight = 0
+            self._fail(task_ids, reason, retryable=False, fatal=True)
             raise ValueError(reason)
+        return feats_list
 
+    def _persist(
+        self, tasks: List[PromptTask], feats_list: List[Dict[str, Any]]
+    ) -> "tuple[List[SampleRef], Optional[CaptureMismatchError]]":
+        """Per-sample: verify against the capture contract, then write to the
+        feature store. Each task self-resolves (commit-ready ref or a fail), so
+        no lease is stranded; the first capture mismatch is returned to the
+        caller to re-raise after the good samples are committed."""
         refs: List[SampleRef] = []
         capture_error: Optional[CaptureMismatchError] = None
         for task, feats in zip(tasks, feats_list):
@@ -132,10 +168,7 @@ class RolloutWorker:
             except CaptureMismatchError as exc:
                 # Loud failure: do not persist a corrupt sample, but keep this
                 # batch's other prompt leases moving so no lease is stranded.
-                self._recent_failures.append(str(exc))
-                self.controller.fail_prompt_tasks(
-                    self.worker_id, [task.task_id], reason=str(exc), retryable=False
-                )
+                self._fail([task.task_id], str(exc), retryable=False)
                 if capture_error is None:
                     capture_error = exc
                 continue
@@ -147,20 +180,10 @@ class RolloutWorker:
                 )
             except Exception as exc:  # partial write -> abort, report
                 self.feature_store.abort(sample_id, reason=f"put_failed:{exc}")
-                self.controller.fail_prompt_tasks(
-                    self.worker_id, [task.task_id], reason=str(exc), retryable=True
-                )
+                self._fail([task.task_id], str(exc), retryable=True)
                 continue
             refs.append(ref)
-
-        if refs:
-            self.controller.commit_samples(self.worker_id, refs)
-            self._last_commit_count += len(refs)
-        self._inflight = 0
-        if capture_error is not None:
-            self._state = "unhealthy"
-            raise capture_error
-        return refs
+        return refs, capture_error
 
     def _put_metadata(self, task: PromptTask) -> Dict[str, Any]:
         return {
