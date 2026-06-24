@@ -27,6 +27,10 @@ from train_eagle3 import build_draft_model, build_dataloaders, build_target_mode
 
 def main():
     parser, args = parse_args()
+    # parse_args() does not derive target_batch_size (train_eagle3.main computes
+    # it inline before building dataloaders); the offline runtime builder and
+    # build_dataloaders both read it, so derive it here too.
+    args.target_batch_size = args.tp_size * args.batch_size
     set_seed(args.seed)
     init_distributed(
         timeout=args.dist_timeout,
