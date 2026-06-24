@@ -71,7 +71,9 @@ def _extract_prompts(train_dataloader):
 
 def main():
     parser, args = parse_args()
-    # sanity_check() (which sets target_batch_size) is not called by this launcher.
+    # parse_args() does not derive target_batch_size (train_eagle3.main computes
+    # it inline before building dataloaders); the runtime builder and
+    # build_dataloaders both read it, so derive it here too.
     args.target_batch_size = args.tp_size * args.batch_size
     set_seed(args.seed)
     init_distributed(
