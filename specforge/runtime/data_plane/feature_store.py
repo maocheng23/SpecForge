@@ -18,6 +18,19 @@ copying them.
 Other backends (shared memory, Mooncake/RDMA) slot in behind the same API; the
 lease/generation/clone-on-fetch primitives are carried here so the in-memory
 backend pays nothing for them but the contract is already exercised.
+
+This is the *minimal core*: relative to the first cut it adds exactly three
+correctness fixes and nothing else.
+
+* **generation-in-URI**: ``mem://`` refs carry their generation in the URI, and
+  ``get()`` rejects a ref whose generation no longer matches the resident
+  sample. This closes the at-least-once redelivery hole where a stale ref could
+  silently alias a freshly re-put sample.
+* **atomic lease registration**: for ``mem://``, the resident read and the lease
+  registration happen under one lock, so a concurrent ``abort`` can never slip
+  between "I read the tensors" and "I registered my borrow".
+* **best-effort dump**: an optional debug dump failure no longer aborts an
+  otherwise successful in-memory publish (mem is authoritative, disk is a tap).
 """
 
 from __future__ import annotations
@@ -27,10 +40,12 @@ import dataclasses
 import gzip
 import io
 import itertools
+import logging
 import os
 import threading
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, quote, urlparse
 
 import torch
 
@@ -40,6 +55,8 @@ from specforge.runtime.contracts import (
     FeatureSpec,
     SampleRef,
 )
+
+logger = logging.getLogger(__name__)
 
 _DTYPE_BYTES = {  # best-effort; falls back to element_size() for real tensors
     "float32": 4,
@@ -52,6 +69,8 @@ _DTYPE_BYTES = {  # best-effort; falls back to element_size() for real tensors
     "bool": 1,
 }
 
+_GENERATION_QUERY_KEY = "generation"
+
 
 def _dtype_str(t: torch.Tensor) -> str:
     return str(t.dtype).replace("torch.", "")
@@ -61,6 +80,19 @@ def spec_from_tensor(name: str, t: torch.Tensor, **kw: Any) -> FeatureSpec:
     return FeatureSpec(
         name=name, shape=tuple(t.shape), dtype=_dtype_str(t), **kw
     )
+
+
+def _make_mem_uri(store_id: str, sample_id: str, generation: int) -> str:
+    return (
+        f"mem://{store_id}/{quote(sample_id, safe='')}"
+        f"?{_GENERATION_QUERY_KEY}={generation}"
+    )
+
+
+def _mem_uri_generation(uri: str) -> Optional[int]:
+    """Extract the generation a ``mem://`` ref was minted for, if present."""
+    values = parse_qs(urlparse(uri).query).get(_GENERATION_QUERY_KEY)
+    return int(values[0]) if values else None
 
 
 class FeatureStore(abc.ABC):
@@ -122,9 +154,10 @@ class LocalFeatureStore(FeatureStore):
     Two ref flavours are served transparently so the loader/trainer path is
     identical online vs offline:
 
-    * ``mem://<store_id>/<sample_id>`` — produced by :meth:`put` (online rollout).
-    * ``file://<abs_path>``           — produced by ``OfflineManifestReader``;
-      :meth:`get` lazily loads the named keys out of the existing file.
+    * ``mem://<store_id>/<sample_id>?generation=<n>`` — produced by :meth:`put`
+      (online rollout).
+    * ``file://<abs_path>`` — produced by ``OfflineManifestReader``; :meth:`get`
+      lazily loads the named keys out of the existing file.
     """
 
     def __init__(
@@ -173,7 +206,8 @@ class LocalFeatureStore(FeatureStore):
         if not tensors:
             raise ValueError("put requires at least one tensor")
         # Atomic from the controller's view: materialize fully, *then* return a
-        # ref. A failure before the final assignment leaves no committed ref.
+        # ref. The over-budget check raises *before* the entry is committed, so
+        # there is nothing to roll back on that path.
         staged = {k: v for k, v in tensors.items()}
         specs = {k: spec_from_tensor(k, v) for k, v in staged.items()}
         # Stamp the target feature's representation + vocab-map version onto its
@@ -190,11 +224,10 @@ class LocalFeatureStore(FeatureStore):
                 target_meta={"vocab_map_version": vmv} if vmv else {},
             )
         num_tokens = int(metadata.get("num_tokens", 0))
+        staged_bytes = sum(t.numel() * t.element_size() for t in staged.values())
         with self._lock:
             if self.max_resident_bytes is not None:
-                projected = self._resident_bytes_locked() + sum(
-                    t.numel() * t.element_size() for t in staged.values()
-                )
+                projected = self._resident_bytes_locked() + staged_bytes
                 if projected > self.max_resident_bytes:
                     raise MemoryError(
                         f"feature store {self.store_id} over budget: "
@@ -204,13 +237,25 @@ class LocalFeatureStore(FeatureStore):
             gen = next(self._gen_counter)
             self._generation[sample_id] = gen
             self._mem[sample_id] = staged
-        if self.dump_dir:  # opt-in capture/replay tap
-            self._dump(sample_id, staged)
-        ref = SampleRef(
+        # Best-effort capture/replay tap. mem is authoritative; a dump failure
+        # must not undo a successful in-memory publish, so it is logged, not
+        # raised.
+        if self.dump_dir:
+            try:
+                self._dump(sample_id, staged)
+            except Exception:  # pragma: no cover - disk is a debug side channel
+                logger.warning(
+                    "feature dump failed for sample %s in store %s; "
+                    "mem publish kept",
+                    sample_id,
+                    self.store_id,
+                    exc_info=True,
+                )
+        return SampleRef(
             sample_id=sample_id,
             run_id=str(metadata.get("run_id", "unknown")),
             source_task_id=metadata.get("source_task_id"),
-            feature_store_uri=f"mem://{self.store_id}/{sample_id}",
+            feature_store_uri=_make_mem_uri(self.store_id, sample_id, gen),
             feature_keys={k: f"{sample_id}/{k}" for k in staged},
             feature_specs=specs,
             strategy=metadata.get("strategy", "eagle3"),
@@ -219,12 +264,9 @@ class LocalFeatureStore(FeatureStore):
             draft_weight_version=metadata.get("draft_weight_version"),
             tokenizer_version=str(metadata.get("tokenizer_version", "unknown")),
             num_tokens=num_tokens,
-            estimated_bytes=sum(t.numel() * t.element_size() for t in staged.values()),
-            metadata={
-                k: v for k, v in metadata.items() if k not in ("num_tokens",)
-            },
+            estimated_bytes=staged_bytes,
+            metadata={k: v for k, v in metadata.items() if k not in ("num_tokens",)},
         )
-        return ref
 
     def _dump(self, sample_id: str, tensors: Dict[str, torch.Tensor]) -> None:
         path = os.path.join(self.dump_dir, f"{sample_id}.ckpt")
@@ -244,34 +286,59 @@ class LocalFeatureStore(FeatureStore):
         wanted = names or list(sample_ref.feature_keys.keys())
         if uri.startswith("file://"):
             tensors = self._get_from_file(uri[len("file://") :], sample_ref, wanted)
-            generation = 0
+            handle = self._register_file_lease(sample_ref)
         else:
-            tensors, generation = self._get_from_mem(sample_ref, wanted)
-        if str(device) != "cpu":
-            tensors = {k: v.to(device) for k, v in tensors.items()}
-        if self.clone_on_get:
-            tensors = {k: v.clone() for k, v in tensors.items()}
-        handle = FeatureHandle(
-            sample_id=sample_ref.sample_id,
-            generation=generation,
-            lease_token=f"{sample_ref.sample_id}:{next(self._counter)}",
-        )
-        with self._lock:
-            self._active_leases[handle.lease_token] = handle
+            tensors, handle = self._get_from_mem(sample_ref, wanted)
+        # Materialization (device move / clone) can fail or OOM. It happens
+        # *after* the lease exists, so on failure we drop the lease before
+        # propagating — no leaked borrow.
+        try:
+            if str(device) != "cpu":
+                tensors = {k: v.to(device) for k, v in tensors.items()}
+            if self.clone_on_get:
+                tensors = {k: v.clone() for k, v in tensors.items()}
+        except Exception:
+            self.release(handle, reason="materialization_failed")
+            raise
         return tensors, handle
 
     def _get_from_mem(
         self, ref: SampleRef, wanted: List[str]
-    ) -> Tuple[Dict[str, torch.Tensor], int]:
+    ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
+        # The resident read and the lease registration share one lock so a
+        # concurrent abort() cannot reclaim the sample between them.
+        expected_generation = _mem_uri_generation(ref.feature_store_uri)
         with self._lock:
             if ref.sample_id not in self._mem:
                 raise KeyError(f"sample {ref.sample_id} not in store {self.store_id}")
-            stored = self._mem[ref.sample_id]
             gen = self._generation.get(ref.sample_id, 0)
-        missing = [n for n in wanted if n not in stored]
-        if missing:
-            raise KeyError(f"sample {ref.sample_id} missing features {missing}")
-        return {n: stored[n] for n in wanted}, gen
+            if expected_generation is not None and gen != expected_generation:
+                raise KeyError(
+                    f"sample {ref.sample_id} generation {expected_generation} "
+                    f"is not resident in store {self.store_id} (current={gen})"
+                )
+            stored = self._mem[ref.sample_id]
+            missing = [n for n in wanted if n not in stored]
+            if missing:
+                raise KeyError(f"sample {ref.sample_id} missing features {missing}")
+            handle = FeatureHandle(
+                sample_id=ref.sample_id,
+                generation=gen,
+                lease_token=f"{ref.sample_id}:{gen}:{next(self._counter)}",
+            )
+            self._active_leases[handle.lease_token] = handle
+            out = {n: stored[n] for n in wanted}
+        return out, handle
+
+    def _register_file_lease(self, ref: SampleRef) -> FeatureHandle:
+        handle = FeatureHandle(
+            sample_id=ref.sample_id,
+            generation=0,
+            lease_token=f"{ref.sample_id}:0:{next(self._counter)}",
+        )
+        with self._lock:
+            self._active_leases[handle.lease_token] = handle
+        return handle
 
     def _get_from_file(
         self, path: str, ref: SampleRef, wanted: List[str]
@@ -300,8 +367,12 @@ class LocalFeatureStore(FeatureStore):
             cur = self._generation.get(handle.sample_id)
             if cur is not None and handle.generation != cur:
                 return  # stale handle (sample was re-put) -> no-op
+            # Count only leases on the CURRENT generation. A sample re-put while
+            # an older generation is still leased gets a fresh generation, so the
+            # stale older-gen lease must not keep the current generation pinned —
+            # otherwise the last current-gen release would leak it.
             still_leased = any(
-                h.sample_id == handle.sample_id
+                h.sample_id == handle.sample_id and h.generation == cur
                 for h in self._active_leases.values()
             )
             if not still_leased:

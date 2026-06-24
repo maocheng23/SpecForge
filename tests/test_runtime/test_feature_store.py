@@ -1,6 +1,7 @@
 # coding=utf-8
 """LocalFeatureStore: atomic put, get, idempotent release, abort, file mode (CPU)."""
 
+import logging
 import os
 import tempfile
 import unittest
@@ -146,6 +147,53 @@ class TestLocalFeatureStore(unittest.TestCase):
             torch.save({"input_ids": torch.arange(4)}, os.path.join(d, "bad.ckpt"))
             with self.assertRaises(KeyError):
                 OfflineManifestReader(d, run_id="off").read()
+
+    def test_mem_ref_carries_generation_and_rejects_stale_ref(self):
+        # The mem:// ref carries the generation it was minted for; once a sample
+        # is reclaimed and a new generation is published under the same id, the
+        # stale ref must be rejected rather than silently aliasing fresh data.
+        store = LocalFeatureStore("st")
+        ref1 = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})
+        self.assertIn("generation=", ref1.feature_store_uri)
+        _, h = store.get(ref1)
+        store.release(h)  # gen1 reclaimed
+        store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})  # gen2
+        with self.assertRaises(KeyError):
+            store.get(ref1)  # stale gen1 ref -> rejected
+
+    def test_release_after_reput_while_leased_does_not_leak(self):
+        # Re-put a sample_id while an older generation is still leased, then drop
+        # the newest handle and finally the stale old handle. Freeing is keyed on
+        # the CURRENT generation's last lease, so the current generation must be
+        # freed and nothing leaks.
+        store = LocalFeatureStore("st")
+        ref1 = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})
+        _, h1 = store.get(ref1)  # lease on gen1
+        ref2 = store.put({"x": torch.randn(1, 8)}, sample_id="s0", metadata={})  # gen2
+        _, h2 = store.get(ref2)  # lease on gen2
+        store.release(h2)  # newest released first (stale gen1 lease still active)
+        store.release(h1)  # stale gen1 handle released last
+        h = store.health()
+        self.assertEqual(h["resident_samples"], 0)
+        self.assertEqual(h["resident_bytes"], 0)
+
+    def test_dump_failure_does_not_abort_publish(self):
+        # The disk dump is a best-effort capture/replay tap; mem is authoritative.
+        # A dump failure must not undo an otherwise successful in-memory publish.
+        class DumpFails(LocalFeatureStore):
+            def _dump(self, sample_id, tensors):
+                raise RuntimeError("disk full")
+
+        with tempfile.TemporaryDirectory() as d:
+            store = DumpFails("st", dump_dir=d)
+            logging.disable(logging.CRITICAL)  # silence the expected warning
+            try:
+                ref = store.put({"x": torch.randn(1, 4)}, sample_id="s0", metadata={})
+            finally:
+                logging.disable(logging.NOTSET)
+            out, h = store.get(ref)  # mem publish survived
+            self.assertIn("x", out)
+            store.release(h)
 
 
 if __name__ == "__main__":
