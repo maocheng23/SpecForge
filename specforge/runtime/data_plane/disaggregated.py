@@ -81,6 +81,7 @@ class SharedDirFeatureStore(FeatureStore):
         auth: Optional[AuthPolicy] = None,
         credential: Optional[str] = None,
         max_hold_age_s: Optional[float] = None,
+        retain_on_release: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.auth = auth or AuthPolicy()
@@ -90,6 +91,11 @@ class SharedDirFeatureStore(FeatureStore):
         self.root = os.path.join(root, self.store_id)
         os.makedirs(self.root, exist_ok=True)
         self.max_hold_age_s = max_hold_age_s
+        # Read-only re-iterable mode: an offline-imported feature set is consumed
+        # across multiple epochs, so release() must NOT physically free it (mirrors
+        # LocalFeatureStore's file:// no-op release). Cleanup is whole-store at run
+        # end; consume-once free (retain_on_release=False) is for online rollout.
+        self.retain_on_release = retain_on_release
         self._clock = clock
         # in-process liveness index (generation / put-time / active leases)
         self._generation: Dict[str, int] = {}
@@ -223,6 +229,8 @@ class SharedDirFeatureStore(FeatureStore):
     def release(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
         with self._lock:
             self._active_leases.pop(handle.lease_token, None)
+            if self.retain_on_release:
+                return  # offline re-iterable set: keep the file for the next epoch
             cur = self._generation.get(handle.sample_id)
             if cur is not None and handle.generation != cur:
                 return  # stale -> no-op
