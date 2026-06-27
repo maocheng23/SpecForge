@@ -130,11 +130,16 @@ class WeightRegistry:
         """
         with self._lock:
             for i in range(len(self._order) - 1, -1, -1):
-                if self._versions[self._order[i]].draft_weight_version == draft_weight_version:
+                if (
+                    self._versions[self._order[i]].draft_weight_version
+                    == draft_weight_version
+                ):
                     return (len(self._order) - 1) - i
             return None
 
-    def record_accept_length(self, version_id: str, accept_length: float) -> WeightVersion:
+    def record_accept_length(
+        self, version_id: str, accept_length: float
+    ) -> WeightVersion:
         with self._lock:
             wv = self._versions[version_id]
             metrics = {**wv.metrics, "accept_length": float(accept_length)}

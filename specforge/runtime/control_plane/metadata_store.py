@@ -326,11 +326,9 @@ class SQLiteMetadataStore(MetadataStore):
                 "SELECT seq FROM weight_versions WHERE version_id = ?", (wv.version_id,)
             ).fetchone()
             if row is None:  # new version -> append at next seq
-                seq = (
-                    self._conn.execute(
-                        "SELECT COALESCE(MAX(seq), -1) + 1 FROM weight_versions"
-                    ).fetchone()[0]
-                )
+                seq = self._conn.execute(
+                    "SELECT COALESCE(MAX(seq), -1) + 1 FROM weight_versions"
+                ).fetchone()[0]
             else:  # upsert keeps publish order (status/metric updates)
                 seq = row[0]
             self._conn.execute(
@@ -343,7 +341,8 @@ class SQLiteMetadataStore(MetadataStore):
     def get_weight_version(self, version_id: str) -> Optional[WeightVersion]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT wv_json FROM weight_versions WHERE version_id = ?", (version_id,)
+                "SELECT wv_json FROM weight_versions WHERE version_id = ?",
+                (version_id,),
             ).fetchone()
         return weight_version_from_json(row[0]) if row else None
 

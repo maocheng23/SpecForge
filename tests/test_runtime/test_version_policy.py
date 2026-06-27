@@ -118,13 +118,17 @@ class TestStalenessPolicy(unittest.TestCase):
     def test_draft_axis(self):
         pol = StalenessPolicy(max_draft_lag=1, require_target_match=False)
         fresh = pol.assess(
-            sample_draft_version="draft-3", sample_target_version="target-A",
-            registry=self.reg, current_target_version="target-A",
+            sample_draft_version="draft-3",
+            sample_target_version="target-A",
+            registry=self.reg,
+            current_target_version="target-A",
         )
         self.assertTrue(fresh.accept)
         stale = pol.assess(
-            sample_draft_version="draft-1", sample_target_version="target-A",
-            registry=self.reg, current_target_version="target-A",
+            sample_draft_version="draft-1",
+            sample_target_version="target-A",
+            registry=self.reg,
+            current_target_version="target-A",
         )
         self.assertFalse(stale.accept)  # lag 2 > max 1
         self.assertEqual(stale.draft_lag, 2)
@@ -132,8 +136,10 @@ class TestStalenessPolicy(unittest.TestCase):
     def test_target_axis(self):
         pol = StalenessPolicy(require_target_match=True)
         a = pol.assess(
-            sample_draft_version="draft-3", sample_target_version="target-OLD",
-            registry=self.reg, current_target_version="target-A",
+            sample_draft_version="draft-3",
+            sample_target_version="target-OLD",
+            registry=self.reg,
+            current_target_version="target-A",
         )
         self.assertFalse(a.accept)
         self.assertTrue(a.target_stale)
@@ -142,8 +148,10 @@ class TestStalenessPolicy(unittest.TestCase):
     def test_unknown_draft_is_maximally_stale(self):
         pol = StalenessPolicy(max_draft_lag=5)
         a = pol.assess(
-            sample_draft_version="draft-ghost", sample_target_version="target-A",
-            registry=self.reg, current_target_version="target-A",
+            sample_draft_version="draft-ghost",
+            sample_target_version="target-A",
+            registry=self.reg,
+            current_target_version="target-A",
         )
         self.assertFalse(a.accept)
         self.assertIn("unknown_draft_version", a.reasons)
