@@ -517,8 +517,18 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-            req.logprob_start_len = len(req.origin_input_ids) - 1
+            # K2.7 + DP-attention: prepare_mlp_sync_batch_raw asserts each req
+            # contributes exactly one logprob token. logprob_start_len = -1 makes
+            # set_extend_input_len set extend_logprob_start_len = len(fill_ids),
+            # so num_tokens_for_logprob == batch_size and the assert holds.
+            # (mirrors the dflash_target_model fix; without it the first online
+            # capture forward asserts under --sglang-enable-dp-attention.)
+            req.logprob_start_len = -1
+            _ext_len = len(req.fill_ids) - len(req.prefix_indices)
+            if hasattr(req, "set_extend_input_len"):
+                req.set_extend_input_len(_ext_len)
+            else:
+                req.extend_input_len = _ext_len
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)
 
@@ -710,8 +720,13 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-            req.logprob_start_len = len(req.origin_input_ids) - 1
+            # See extend(): same DP-attention logprob assert fix (VLM path).
+            req.logprob_start_len = -1
+            _ext_len = len(req.fill_ids) - len(req.prefix_indices)
+            if hasattr(req, "set_extend_input_len"):
+                req.set_extend_input_len(_ext_len)
+            else:
+                req.extend_input_len = _ext_len
             req.multimodal_inputs = mm_inputs
             data_cache.append([input_id_, attention_mask_, loss_mask_])
             reqs.append(req)

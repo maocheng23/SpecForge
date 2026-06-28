@@ -19,15 +19,32 @@ from transformers import (
 )
 
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
-from .target.custom_backend import (
-    GptOssForCausalLM,
-    Llama4ForCausalLM,
-    LlamaForCausalLM,
-    Phi3ForCausalLM,
-    Qwen2ForCausalLM,
-    Qwen3ForCausalLM,
-    Qwen3MoeForCausalLM,
-)
+
+# The HF custom_backend target models (llama/llama4/phi3/gpt_oss/qwen2/qwen3/
+# qwen3_moe) are written against transformers 4.57.x APIs (check_model_inputs,
+# can_return_tuple, auto_docstring, ...) that were removed/moved in transformers
+# 5.x. They are only used by --target-model-backend hf; our DFlash K2.7 run uses
+# the sglang backend (and a qwen3 draft, which IS 5.x-compatible), so stub them
+# out to keep specforge.modeling importable on the transformers 5.x that this
+# sglang tree pins. They are never instantiated on the sglang path.
+try:
+    from .target.custom_backend import (
+        GptOssForCausalLM,
+        Llama4ForCausalLM,
+        LlamaForCausalLM,
+        Phi3ForCausalLM,
+        Qwen2ForCausalLM,
+        Qwen3ForCausalLM,
+        Qwen3MoeForCausalLM,
+    )
+except ImportError as _custom_backend_err:  # noqa: F841
+    GptOssForCausalLM = None
+    Llama4ForCausalLM = None
+    LlamaForCausalLM = None
+    Phi3ForCausalLM = None
+    Qwen2ForCausalLM = None
+    Qwen3ForCausalLM = None
+    Qwen3MoeForCausalLM = None
 
 
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):

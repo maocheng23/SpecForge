@@ -53,17 +53,26 @@ def replaced_logits_processor_forward_for_eagle3(
     Updated for sglang 0.5.9:
     - Added hidden_states_before_norm parameter for compatibility
     """
+    # Extract MIS indices BEFORE the ForwardBatch -> LogitsMetadata conversion.
+    # Newer sglang (post-0.5.9) dropped the LogitsProcessor.multi_item_delimiter
+    # attribute and carries multi_item_delimiter_indices on the ForwardBatch
+    # instead; compute_logprobs_for_multi_item_scoring now takes those indices.
+    # (None during eagle3 training, so this branch is skipped.)
+    multi_item_delimiter_indices = None
     if isinstance(logits_metadata, ForwardBatch):
+        multi_item_delimiter_indices = getattr(
+            logits_metadata, "multi_item_delimiter_indices", None
+        )
         logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
-    # Multi-item scoring only for prefill-only requests.
-    if self.multi_item_delimiter is not None and logits_metadata.is_prefill_only:
+    # Multi-item scoring only for prefill-only requests with pre-computed indices.
+    if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
         return self.compute_logprobs_for_multi_item_scoring(
             input_ids,
             hidden_states,
             lm_head,
             logits_metadata,
-            self.multi_item_delimiter,
+            multi_item_delimiter_indices,
         )
 
     # Diffusion LLM only.
@@ -281,10 +290,22 @@ def wrap_eagle3_logits_processors_in_module(
     """
     This function will wrap the SGLang's original logits processor with the modified one for EAGLE3.
     """
-    for name, submodule in module.named_modules():
+    # Materialize to a list first: the setattr below mutates module._modules,
+    # which raises "dictionary changed size during iteration" on the live
+    # named_modules() generator. Also resolve dotted names to the OWNING parent
+    # module so nested processors are actually replaced -- for a multimodal
+    # target (e.g. KimiK25) the processor is at "language_model.logits_processor"
+    # and setattr(module, "language_model.logits_processor", ...) would only
+    # create a bogus shadow attribute, leaving the real processor unwrapped.
+    for name, submodule in list(module.named_modules()):
         if isinstance(submodule, LogitsProcessor):
             wrapped = LogitsProcessorForEAGLE3(submodule, return_full_logits)
-            setattr(module, name, wrapped)
+            if "." in name:
+                parent_name, attr = name.rsplit(".", 1)
+                parent = module.get_submodule(parent_name)
+            else:
+                parent, attr = module, name
+            setattr(parent, attr, wrapped)
             print(f"wrapped {name} with LogitsProcessorForEAGLE3")
 
 
