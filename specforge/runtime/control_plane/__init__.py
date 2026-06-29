@@ -6,6 +6,7 @@ from specforge.runtime.control_plane.backpressure import (
     BackpressureController,
 )
 from specforge.runtime.control_plane.controller import DataFlowController, TrainLease
+from specforge.runtime.control_plane.durable_queue import SQLiteSampleRefQueue
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
     MetadataStore,
@@ -18,6 +19,7 @@ __all__ = [
     "MetadataStore",
     "InMemoryMetadataStore",
     "SQLiteMetadataStore",
+    "SQLiteSampleRefQueue",
     "BackpressureConfig",
     "BackpressureController",
 ]
