@@ -153,6 +153,16 @@ def run_producer(args) -> None:
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
     prompts = _producer_prompts(args, tokenizer)
+    # The streaming channel is consume-once, so multi-epoch training means the
+    # producer must re-stream the pool once per epoch (servers are idle anyway).
+    epochs = int(getattr(args, "num_epochs", 1) or 1)
+    if epochs > 1:
+        base = len(prompts)
+        prompts = prompts * epochs
+        print(
+            f"[producer] replicated {base} prompts x{epochs} epochs -> {len(prompts)}",
+            flush=True,
+        )
     max_prompts = _max("DISAGG_MAX_PROMPTS", 0)
     if max_prompts:
         prompts = prompts[:max_prompts]
