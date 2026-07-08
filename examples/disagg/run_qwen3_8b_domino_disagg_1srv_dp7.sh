@@ -169,8 +169,8 @@ ARGS=(
     --warmup-ratio 0.04
     --max-grad-norm 1.0
     --attention-backend flex_attention
-    --block-size ${BLOCK_SIZE:-16}
-    --num-anchors ${NUM_ANCHORS:-256}
+    --block-size 16
+    --num-anchors 256
     --loss-decay-gamma 7.0
     --num-epochs ${NUM_EPOCHS}
     --seed 42

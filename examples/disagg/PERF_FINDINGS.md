@@ -91,10 +91,21 @@ the next wall.
 
 So the low demand is **by design, not inefficiency**: domino deliberately does
 256× the per-token prediction work to densify the draft's training signal. The
-optimizer/comm is a non-factor under `ACCUM=8` (1.3 ms/microstep). `num_anchors`
-is a **quality↔throughput knob**, not a free win — fewer anchors = less training
-signal per sample, so it trades acceptance-length/convergence for speed and must
-be validated on the acceptance-length curve, not adopted blindly.
+optimizer/comm is a non-factor under `ACCUM=8` (1.3 ms/microstep).
+
+**`num_anchors` is NOT a throughput lever — do not reduce it for speed.** The
+metric that matters is training signal per second (anchor-updates/s), not
+sequences/s. Because each anchor is a supervised training target, and there is a
+fixed ~53 ms/microstep per-sequence overhead (base forward + embedding + GRU +
+the vocab head over the base positions), *fewer* anchors amortize that fixed cost
+over less signal: at 256 anchors ≈ 2,130 anchor-updates/s vs at 64 anchors ≈
+1,280 anchor-updates/s. So dropping anchors makes sequences/s rise but
+training-signal/s **fall ~40%**, and — since the pipeline is supply-bound —
+forces you to capture ~4× more sequences for the same signal, piling load onto
+the exact bottleneck. Treat `num_anchors` purely as a quality/data-efficiency
+setting (validated on the acceptance-length curve); the launcher keeps it fixed
+at 256. The real memory/compute lever is the **full-vocab loss layer** (next
+section), which is reducible without touching the training signal.
 
 ## Remaining ceilings (need code, not config)
 
