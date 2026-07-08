@@ -1,11 +1,13 @@
 # coding=utf-8
 """Domino Training Wrapper."""
 
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _checkpoint
 
 from specforge.core.dflash import (
     FLEX_ATTENTION_AVAILABLE,
@@ -57,6 +59,23 @@ class OnlineDominoModel(nn.Module):
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
         self.shift_label = shift_label
+
+        # Fused / row-tiled loss (opt-in; dense path stays default). Chunks the
+        # head+CE over the anchor dim and recomputes each chunk in backward, so
+        # the two full-vocab (base + final) logit tensors are never all live at
+        # once — bounding the loss-layer peak to one anchor-chunk. Math-exact
+        # (fp-close). See examples/disagg/PERF_FINDINGS.md.
+        self.fused_ce = os.environ.get("DOMINO_FUSED_CE", "0") == "1"
+        self.ce_chunk = max(1, int(os.environ.get("DOMINO_CE_CHUNK", "32")))
+        # When the schedule has decayed lambda_base to exactly 0, the base CE
+        # contributes 0 to the total-loss gradient; skipping its cross-entropy
+        # (not its projection — base_logits still feeds final + base metrics) is
+        # gradient-identical and saves that CE's fwd/bwd. Only ever guarded on
+        # ==0.0 (the ==1.0 case would zero embed_proj/GRU grads vs the dense
+        # materialized-zero and is NOT applied).
+        self.fused_skip_zero_base_ce = (
+            os.environ.get("DOMINO_SKIP_ZERO_BASE_CE", "1") == "1"
+        )
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -253,10 +272,95 @@ class OnlineDominoModel(nn.Module):
         suffix_logits = base_logits4d[:, :, self._suffix_start :, :] + logits_e
         return torch.cat([prefix_logits, suffix_logits], dim=2)
 
+    def _fused_head_and_losses(
+        self,
+        output_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        target_ids: torch.Tensor,
+        weight_mask: torch.Tensor,
+        lambda_base: float,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Row-tiled, activation-checkpointed equivalent of the dense head+CE.
+
+        Chunks the anchor dim; each chunk computes base_logits = lm_head(hidden),
+        the domino-head final_logits, and both weighted CE numerators, then is
+        recomputed in backward (``checkpoint``) so the full-vocab logit tensors
+        for all anchors are never simultaneously live. Math-exact vs the dense
+        path up to bf16 cross-chunk reassociation. Returns
+        ``(loss, final_loss, base_loss, pred_ids, base_pred_ids)`` where the two
+        pred-id tensors are full-vocab argmaxes flattened in the same
+        ``(bsz, n, bs)`` row-major order as the dense ``flat_logits``.
+        """
+        bsz, n, bs = target_ids.shape
+        hidden4d, prev_ids = self._build_domino_head_inputs(
+            input_ids, anchor_positions, target_ids, output_hidden
+        )
+        valid_token_count = weight_mask.reshape(-1).sum() + 1e-6
+        # base CE contributes lambda_base * base_loss to the total; at exactly 0
+        # its gradient is 0, so its cross-entropy is safe to skip (base_logits
+        # itself is still built — final = base + correction, and base metrics).
+        skip_base = self.fused_skip_zero_base_ce and float(lambda_base) == 0.0
+
+        def _chunk(h4d_c, prev_c, tgt_c, w_c):
+            base_c = self.lm_head(h4d_c)
+            final_c = self._apply_domino_head(base_c, h4d_c, prev_c, tgt_c)
+            vocab = base_c.shape[-1]
+            flat_final = final_c.reshape(-1, vocab)
+            flat_base = base_c.reshape(-1, vocab)
+            t = tgt_c.reshape(-1)
+            w = w_c.reshape(-1)
+            fnum = (
+                F.cross_entropy(flat_final, t, reduction="none") * w
+            ).sum()
+            if skip_base:
+                bnum = fnum.new_zeros(())
+            else:
+                bnum = (
+                    F.cross_entropy(flat_base, t, reduction="none") * w
+                ).sum()
+            with torch.no_grad():
+                p = flat_final.argmax(dim=-1)
+                bp = flat_base.argmax(dim=-1)
+            return fnum, bnum, p, bp
+
+        final_num = output_hidden.new_zeros(())
+        base_num = output_hidden.new_zeros(())
+        pred_chunks = []
+        base_pred_chunks = []
+        for c0 in range(0, n, self.ce_chunk):
+            c1 = min(n, c0 + self.ce_chunk)
+            args = (
+                hidden4d[:, c0:c1],
+                prev_ids[:, c0:c1],
+                target_ids[:, c0:c1],
+                weight_mask[:, c0:c1],
+            )
+            if torch.is_grad_enabled() and output_hidden.requires_grad:
+                fnum, bnum, p, bp = _checkpoint.checkpoint(
+                    _chunk, *args, use_reentrant=False
+                )
+            else:
+                fnum, bnum, p, bp = _chunk(*args)
+            final_num = final_num + fnum
+            base_num = base_num + bnum
+            # p/bp are (bsz*nc*bs,) in (b, nc, bs) order -> restore anchor dim.
+            pred_chunks.append(p.reshape(bsz, -1, bs))
+            base_pred_chunks.append(bp.reshape(bsz, -1, bs))
+
+        final_loss = final_num / valid_token_count
+        base_loss = base_num / valid_token_count
+        loss = (1.0 - lambda_base) * final_loss + lambda_base * base_loss
+        pred_ids = torch.cat(pred_chunks, dim=1).reshape(-1)
+        base_pred_ids = torch.cat(base_pred_chunks, dim=1).reshape(-1)
+        return loss, final_loss, base_loss, pred_ids, base_pred_ids
+
     def _compute_extra_metrics(
         self,
         pred_ids: torch.Tensor,
-        flat_base_logits: torch.Tensor,
+        base_pred_ids: torch.Tensor,
         flat_targets: torch.Tensor,
         binary_eval_mask: torch.Tensor,
         actual_token_count: torch.Tensor,
@@ -266,10 +370,14 @@ class OnlineDominoModel(nn.Module):
         base_loss: torch.Tensor,
         lambda_base: float,
     ) -> Dict[str, torch.Tensor]:
-        """Compute auxiliary training metrics that do not affect gradients."""
+        """Compute auxiliary training metrics that do not affect gradients.
+
+        ``pred_ids`` / ``base_pred_ids`` are the full-vocab argmaxes of the final
+        and base logits, precomputed by the caller (both the dense and the fused
+        loss paths produce them) so this never needs the full logit tensors.
+        """
         bsz, n, bs = target_ids.shape
 
-        base_pred_ids = torch.argmax(flat_base_logits, dim=-1)
         base_correct = (base_pred_ids == flat_targets) & (binary_eval_mask > 0.5)
         base_accuracy = base_correct.sum().float() / actual_token_count
 
@@ -400,22 +508,9 @@ class OnlineDominoModel(nn.Module):
         )
 
         bsz, n, bs = target_ids.shape
-        base_logits = self.lm_head(output_hidden)
-        hidden4d, prev_ids = self._build_domino_head_inputs(
-            input_ids=input_ids,
-            anchor_positions=anchor_positions,
-            target_ids=target_ids,
-            output_hidden=output_hidden,
-        )
-        base_logits4d = base_logits.reshape(bsz, n, bs, -1)
-        final_logits = self._apply_domino_head(
-            base_logits4d=base_logits4d,
-            hidden4d=hidden4d,
-            prev_ids=prev_ids,
-            target_ids=target_ids,
-        ).reshape(bsz, n * bs, -1)
 
         # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
+        # Computed before the logits so it can be fed to either loss path.
         weight_mask = (
             block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
         )
@@ -445,19 +540,53 @@ class OnlineDominoModel(nn.Module):
             )
             weight_mask = weight_mask * decay_weights
 
-        loss, final_loss, base_loss, flat_logits, flat_base_logits, flat_targets = (
-            self._compute_weighted_losses(
-                final_logits=final_logits,
-                base_logits=base_logits,
-                target_ids=target_ids,
-                weight_mask=weight_mask,
-                lambda_base=lambda_base,
-            )
-        )
+        flat_targets = target_ids.reshape(-1)
 
-        # --- Accuracy ---
+        if self.fused_ce:
+            # Row-tiled + checkpointed head+CE: never materializes the two
+            # full-vocab logit tensors for all anchors at once. Math-exact
+            # (fp-close) vs the dense branch below.
+            loss, final_loss, base_loss, pred_ids, base_pred_ids = (
+                self._fused_head_and_losses(
+                    output_hidden=output_hidden,
+                    input_ids=input_ids,
+                    anchor_positions=anchor_positions,
+                    target_ids=target_ids,
+                    weight_mask=weight_mask,
+                    lambda_base=lambda_base,
+                )
+            )
+        else:
+            base_logits = self.lm_head(output_hidden)
+            hidden4d, prev_ids = self._build_domino_head_inputs(
+                input_ids=input_ids,
+                anchor_positions=anchor_positions,
+                target_ids=target_ids,
+                output_hidden=output_hidden,
+            )
+            base_logits4d = base_logits.reshape(bsz, n, bs, -1)
+            final_logits = self._apply_domino_head(
+                base_logits4d=base_logits4d,
+                hidden4d=hidden4d,
+                prev_ids=prev_ids,
+                target_ids=target_ids,
+            ).reshape(bsz, n * bs, -1)
+
+            loss, final_loss, base_loss, flat_logits, flat_base_logits, _ = (
+                self._compute_weighted_losses(
+                    final_logits=final_logits,
+                    base_logits=base_logits,
+                    target_ids=target_ids,
+                    weight_mask=weight_mask,
+                    lambda_base=lambda_base,
+                )
+            )
+            with torch.no_grad():
+                pred_ids = torch.argmax(flat_logits, dim=-1)
+                base_pred_ids = torch.argmax(flat_base_logits, dim=-1)
+
+        # --- Accuracy (shared by both paths) ---
         with torch.no_grad():
-            pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
             accuracy_denom = binary_eval_mask.sum()
             actual_token_count = accuracy_denom + 1e-6
@@ -465,7 +594,7 @@ class OnlineDominoModel(nn.Module):
 
             metrics = self._compute_extra_metrics(
                 pred_ids=pred_ids,
-                flat_base_logits=flat_base_logits,
+                base_pred_ids=base_pred_ids,
                 flat_targets=flat_targets,
                 binary_eval_mask=binary_eval_mask,
                 actual_token_count=actual_token_count,
