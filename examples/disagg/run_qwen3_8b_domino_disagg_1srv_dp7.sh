@@ -47,7 +47,7 @@ if [[ "$DISAGG_CLIENT_SEGMENT_SIZE" -ne 0 ]]; then
 fi
 
 export DISAGG_STORE_ID=${DISAGG_STORE_ID:-qwen3-8b-domino-1srv-dp7}
-export DISAGG_SERVER_URLS="http://127.0.0.1:$SERVER0_PORT"
+export DISAGG_SERVER_URLS="${DISAGG_SERVER_URLS:-http://127.0.0.1:$SERVER0_PORT}"
 export DISAGG_REF_CHANNEL=${DISAGG_REF_CHANNEL:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/refs.jsonl}
 DISAGG_DB=${DISAGG_DB:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/run.db}
 DISAGG_INBOX_DIR=${DISAGG_INBOX_DIR:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/inboxes}
@@ -133,7 +133,7 @@ launch_server() { # $1=gpus $2=port
             --trust-remote-code \
             --skip-tokenizer-init \
             --tp-size "$SERVER_TP" \
-            --mem-fraction-static 0.85 \
+            --mem-fraction-static "${SERVER_MEM_FRACTION:-0.85}" \
             --chunked-prefill-size -1 \
             --disable-radix-cache \
             --enable-spec-capture \
@@ -164,12 +164,13 @@ ARGS=(
     --chat-template "$CHAT_TEMPLATE"
     --max-length 3072
     --batch-size ${BATCH_SIZE}
+    --accumulation-steps ${ACCUM:-1}
     --learning-rate 6e-4
     --warmup-ratio 0.04
     --max-grad-norm 1.0
     --attention-backend flex_attention
-    --block-size 16
-    --num-anchors 256
+    --block-size ${BLOCK_SIZE:-16}
+    --num-anchors ${NUM_ANCHORS:-256}
     --loss-decay-gamma 7.0
     --num-epochs ${NUM_EPOCHS}
     --seed 42

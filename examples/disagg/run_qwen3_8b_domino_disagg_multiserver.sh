@@ -61,7 +61,7 @@ if [[ "$DISAGG_CLIENT_SEGMENT_SIZE" -ne 0 ]]; then
 fi
 
 export DISAGG_STORE_ID=${DISAGG_STORE_ID:-qwen3-8b-domino-disagg-2srv}
-export DISAGG_SERVER_URLS="http://127.0.0.1:$SERVER0_PORT,http://127.0.0.1:$SERVER1_PORT"
+export DISAGG_SERVER_URLS="${DISAGG_SERVER_URLS:-http://127.0.0.1:$SERVER0_PORT,http://127.0.0.1:$SERVER1_PORT}"
 export DISAGG_REF_CHANNEL=${DISAGG_REF_CHANNEL:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/refs.jsonl}
 DISAGG_DB=${DISAGG_DB:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/run.db}
 DISAGG_INBOX_DIR=${DISAGG_INBOX_DIR:-$ROOT_DIR/outputs/$DISAGG_STORE_ID/inboxes}
@@ -146,7 +146,7 @@ launch_server() { # $1=gpus $2=port
             --trust-remote-code \
             --skip-tokenizer-init \
             --tp-size "$SERVER_TP" \
-            --mem-fraction-static 0.85 \
+            --mem-fraction-static "${SERVER_MEM_FRACTION:-0.85}" \
             --chunked-prefill-size -1 \
             --disable-radix-cache \
             --enable-spec-capture \
@@ -181,7 +181,8 @@ ARGS=(
     --train-data-path "$TRAIN_DATA_PATH"
     --chat-template "$CHAT_TEMPLATE"
     --max-length 3072
-    --batch-size 2
+    --batch-size ${BATCH_SIZE:-2}
+    --accumulation-steps ${ACCUM:-1}
     --learning-rate 6e-4
     --warmup-ratio 0.04
     --max-grad-norm 1.0
