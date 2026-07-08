@@ -671,15 +671,32 @@ def build_disagg_online_producer(
             return st["prompts_pending"] == 0 and st["prompts_leased"] == 0
 
         def run_worker(w) -> None:
+            import os as _os
+
+            # PROFILE_PRODUCER=N -> every N rounds print one [prod] line
+            # splitting the round into backpressure-park / run_once / publish.
+            _prof = int(_os.environ.get("PROFILE_PRODUCER", "0"))
+            _ps = {
+                "rounds": 0, "refs": 0, "bp": 0.0, "once": 0.0, "pub": 0.0,
+                "t0": time.monotonic(), "infl": 0, "infl_max": 0,
+            }
             failures = 0
             for _ in range(max_rounds):
                 if should_stop is not None and should_stop():
                     return
                 # backpressure: in_flight = published - consumer-acked
-                while channel.in_flight_remote() >= in_flight_high_watermark:
+                _t = time.monotonic()
+                _infl = channel.in_flight_remote()
+                while _infl >= in_flight_high_watermark:
                     if should_stop is not None and should_stop():
                         return
                     sleep(backpressure_poll_s)
+                    _infl = channel.in_flight_remote()
+                if _prof:
+                    _ps["bp"] += time.monotonic() - _t
+                    _ps["infl"] = _infl
+                    _ps["infl_max"] = max(_ps["infl_max"], _infl)
+                _t = time.monotonic()
                 try:
                     refs = w.run_once(max_tasks=lease)
                 except Exception as exc:
@@ -706,10 +723,31 @@ def build_disagg_online_producer(
                     sleep(backpressure_poll_s)
                     continue
                 failures = 0
+                if _prof:
+                    _ps["once"] += time.monotonic() - _t
                 if refs:
+                    _t = time.monotonic()
                     with publish_lock:
                         channel.publish_many(refs)
                         state["produced"] += len(refs)
+                    if _prof:
+                        _ps["pub"] += time.monotonic() - _t
+                        _ps["rounds"] += 1
+                        _ps["refs"] += len(refs)
+                        if _ps["rounds"] >= _prof:
+                            _win = time.monotonic() - _ps["t0"]
+                            print(
+                                f"[prod] w={w.worker_id} rounds={_ps['rounds']} "
+                                f"refs={_ps['refs']} rate={_ps['refs']/_win:.1f}/s "
+                                f"in_flight={_ps['infl']} in_flight_max={_ps['infl_max']} "
+                                f"bp_s={_ps['bp']:.2f} once_s={_ps['once']:.2f} "
+                                f"pub_s={_ps['pub']:.2f} win_s={_win:.2f}",
+                                flush=True,
+                            )
+                            _ps.update(
+                                rounds=0, refs=0, bp=0.0, once=0.0, pub=0.0,
+                                t0=time.monotonic(), infl_max=0,
+                            )
                 elif pool_drained():
                     return
                 else:
