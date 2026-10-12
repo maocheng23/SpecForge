@@ -6,6 +6,12 @@
 # trainer kernels on this revision: an H200 trainer rank then trains about 7.4
 # samples/s against 4.4 captured prompts/s per server. On older revisions keep
 # the 4+4 recipe.
+#
+# Balanced dispatch, last-micro-batch metrics, the capture fast paths and the
+# 32k prefill budget ("Balanced dispatch, capture fast paths and MFU" in the
+# recipe doc) were measured on a 4096-token corpus, where they take one 8x H200
+# node from 35.6% to 48.4% MFU; with such short conversations use 4 servers +
+# DP4 (accumulation_steps 4).
 model:
   target_model_path: Qwen/Qwen3.8-27B-FP8
   draft_model_config: configs/qwen3.8-27b-dflash2.json
@@ -24,6 +30,9 @@ model:
   sglang_linear_attn_prefill_backend: flashinfer
   sglang_extra_args: ["--cuda-graph-backend-decode", "disabled"]
   sglang_disable_radix_cache: true
+  # Twice SGLang's default prefill budget: with producer_concurrency 8 each
+  # capture forward packs ~12 prompts / 30k tokens instead of 4 / 10k (+3%).
+  sglang_max_prefill_tokens: 32768
   # data.max_length + 7 tokens of request headroom for the capture endpoint.
   sglang_context_length: 8199
 
@@ -59,6 +68,9 @@ training:
   # the dflash/teacher/* diagnostics on log steps. Skipping it removes 1/6 of
   # every sample's capture, Mooncake and fetch bytes.
   dflash_teacher_metrics: false
+  # Run the log-step diagnostics (full-vocabulary softmax/top-k) on the last
+  # micro-batch of the accumulation window only.
+  detailed_metrics: last_microbatch
   save_interval: 500
   log_interval: 10
   dist_timeout: 30
@@ -69,8 +81,12 @@ tracking:
   report_to: none
 
 runtime:
-  producer_lease: 4
-  producer_concurrency: 4
+  # Plan each 36-sample window as a whole: similar samples share micro-batches
+  # and the three ranks get equal work, so they reach the gradient reduction
+  # together (+11% trainer throughput on 8x H200).
+  balanced_dispatch: true
+  producer_lease: 8
+  producer_concurrency: 8
   # High/low watermarks hold 8/4 global optimizer steps (36 samples each).
   in_flight_high_watermark: 288
   in_flight_low_watermark: 144
@@ -106,19 +122,31 @@ deployment:
           cuda_visible_devices: ["0"]
           tp_size: 1
           mem_fraction_static: 0.85
+          # Capture fast paths of the v0.5.18 capture patch, each bitwise
+          # identical on the captured taps: stop after the last tapped layer,
+          # FA3 varlen prefill without the paged KV write, and GDN prefill
+          # without the q|k|v / z copies (+9% per server on 8x H200).
+          env: &capture_fast_paths
+            SGLANG_SPEC_CAPTURE_SKIP_TAIL: "1"
+            SGLANG_CAPTURE_FA_SKIP_KV: "1"
+            SGLANG_GDN_NOCOPY: "1"
         - port: 30001
           cuda_visible_devices: ["1"]
           tp_size: 1
           mem_fraction_static: 0.85
+          env: *capture_fast_paths
         - port: 30002
           cuda_visible_devices: ["2"]
           tp_size: 1
           mem_fraction_static: 0.85
+          env: *capture_fast_paths
         - port: 30003
           cuda_visible_devices: ["3"]
           tp_size: 1
           mem_fraction_static: 0.85
+          env: *capture_fast_paths
         - port: 30004
           cuda_visible_devices: ["4"]
           tp_size: 1
           mem_fraction_static: 0.85
+          env: *capture_fast_paths

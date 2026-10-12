@@ -179,6 +179,51 @@ by up to 17% when it is batched with other prompts). Set
 warm-up sweep on every server start (20-25 min to under a minute once its JIT
 cache is populated).
 
+### Balanced dispatch, capture fast paths and MFU
+
+The recipe now also turns on four settings, each measured where its side of
+the node is the bottleneck:
+
+| Setting | Effect | Measured gain |
+| --- | --- | --- |
+| `runtime.balanced_dispatch: true` | Rank 0 plans each optimizer window as a whole: refs of similar estimated trainer work (kept anchors, tokens) share micro-batches and every rank gets the same work. Round-robin windows left ranks waiting up to ~100 ms in the gradient reduce-scatter for the slowest one. | trainer +7.7% |
+| `training.detailed_metrics: last_microbatch` | The log-step diagnostics (full-vocabulary softmax/top-k per block row) run on the last micro-batch only. | trainer +2.8% |
+| `capture_servers[].env`: `SGLANG_SPEC_CAPTURE_SKIP_TAIL`, `SGLANG_CAPTURE_FA_SKIP_KV`, `SGLANG_GDN_NOCOPY` | Stop after the last tapped layer (61), FA3 varlen capture prefill without the paged KV write, and GDN prefill without the `q|k|v` concatenation and `q`/`k`/`v`/`z` copies (Qwen3.8's 48/16 GDN head ratio misses SGLang's fused split; the copies were 7.2% of server time, now 0.4%). Each leaves the captured taps bitwise identical (52 real captures). | server +8.9% |
+| `model.sglang_max_prefill_tokens: 32768`, `runtime.producer_concurrency: 8` | Each capture forward packs ~12 prompts / 30k tokens instead of 4 / 10k. | node +3% |
+
+The step objective is unchanged: gradients use the optimizer step's global
+loss denominator, so regrouping a window's samples only changes summation
+order.
+
+**MFU.** Model FLOPs only: the target's layers 0-61 (the capture needs the
+output of the last tapped layer), scored against 1979 TFLOP/s for its FP8
+GEMMs and 989 TFLOP/s for its BF16 attention, GDN and norms, plus the draft's
+forward and backward against 989 TFLOP/s (BF16 dense), with the frozen LM head
+counted as forward plus input gradient on the 7 predicted slots of each block.
+Padding rows, recompute and diagnostics are not counted. Overall MFU is the
+mean over the 8 GPUs. Measured on one 8x H200 node over steps 101-200 of
+200-step runs, on a 50k seed-42 sample of the regeneration corpus truncated to
+4096 tokens (mean 2,573 tokens, 453 kept anchors per sample; 100% MFU would be
+66.6 samples/s):
+
+| Configuration | Split | samples/s | Server MFU | Trainer MFU | Overall MFU |
+| --- | --- | --- | --- | --- | --- |
+| previous recipe | 5+3 | 23.72 | 30.3% | 44.4% | 35.6% |
+| previous recipe, re-split | 4+4 | 28.79 | 46.0% | 40.5% | 43.2% |
+| + balanced dispatch, last-micro-batch metrics | 5+3 | 26.44 | 33.8% | 49.6% | 39.7% |
+| + capture fast paths (server-bound check) | 3+5 | 23.37 vs 21.46 | 49.8% vs 45.7% | | |
+| all of the above | 4+4 | 31.29 | 50.0% | 44.0% | 47.0% |
+| + 32k prefill budget, 8 concurrent captures | 4+4 | 32.22 | 51.5% | 45.3% | 48.4% |
+
+Every GPU sits at its software power cap (~690 W): capture servers run near
+1,450 MHz and trainers near 1,700 MHz against the 1,830 MHz the dense peaks
+assume. Micro-batch 2 stays best with balanced dispatch (micro-batch 1: 25.85
+samples/s, micro-batch 4: 25.07, both at 5+3). The split follows the corpus
+length: with conversations up to 4096 tokens 4+4 is fastest, while the
+8192-token corpus above keeps 5+3 (the per-sample capture cost grows with
+length, the trainer cost mostly with the 512-anchor cap); the 8192-token corpus
+was not re-measured with these settings.
+
 ## Two nodes: eight servers + DP8
 
 ```bash
