@@ -36,6 +36,21 @@ outstanding, so a lone in-flight response cannot deadlock a waiting
 producer. Set `SGLANG_SPEC_CAPTURE_TIMING=1` to log per-stage
 materialize/register/put timings and queue-to-stream latency.
 
+The v0.5.18 patch also carries experimental capture-server fast paths. Each is
+off unless its variable is `1` in the server environment (for managed-local
+launches, `deployment.disaggregated.managed_local.capture_servers[].env`).
+Each path logs once when it engages, or says why it was ignored:
+
+| Variable | Effect | Engages only when |
+|---|---|---|
+| `SGLANG_SPEC_CAPTURE_SKIP_TAIL` | Stops the Qwen3.5 dense text model right after the last aux tap is captured (the input of layer `max(aux)+1`). Skips the remaining layers, the final norm, the logits, and the last-hidden clone/D2H. | Every request in the batch is a prefill-only capture request that asks for `aux` and not `last_hidden` (teacher metrics off). The batch has no cached prefix and no logprobs, the radix cache is off, and the server runs a single pipeline stage with no DP attention, prefill CP or TBO. Warmup, `/health_generate` and mixed batches run the full model. |
+| `SGLANG_CAPTURE_FA_SKIP_KV` | FA3 prefill of capture batches runs on the varlen kernel over raw K/V and skips the paged KV-cache write. This mirrors `fa_skip_kv_cache` on embedding servers. | Spec capture is on, chunked prefill is `-1`, radix cache is off, the model is non-MLA, FA version is 3, the KV cache is model-dtype (no FP8 descale), and the batch is capture-only and prefill-only with no prefix. |
+| `SGLANG_GDN_NOCOPY` | Qwen3.5-layout GDN layers whose value/key head ratio is outside the fused split kernel's set (Qwen3.8-27B: 48/16 = 3) stop copying in prefill: `[q|k|v]` is passed to the causal conv as a strided column slice instead of a `torch.cat` (the Triton conv then writes a dense channel-last output), a chunked fused split writes contiguous q/k/v for any `qkv_dim` (no `.contiguous()` per tensor), and the gated RMSNorm runs on `[T, H*D]` rows with `group_size=D` and a head-tiled weight, so `z` stays a strided view. Bitwise identical taps. | CUDA, Qwen3.5 contiguous `[q|k|v|z]` projection layout, 2-D projection output; otherwise the stock path runs. |
+
+`SGLANG_SPEC_CAPTURE_DEBUG_DUMP=<dir>` is for parity checks only. It
+`torch.save`s each staged sample to `<dir>/<store>_<sample>_g<gen>.pt` and
+never contacts Mooncake, so never set it on a training server.
+
 The client boundary is
 [`adapters/server_capture.py`](adapters/server_capture.py). Algorithm-owned
 providers map generic server artifacts (`aux`, `last_hidden`, passthrough
