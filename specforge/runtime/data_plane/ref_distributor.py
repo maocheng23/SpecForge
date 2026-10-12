@@ -52,6 +52,7 @@ from collections import Counter
 from typing import Iterable, List, Optional
 
 from specforge.runtime.contracts import SampleRef
+from specforge.runtime.data_plane.dispatch_balance import plan_balanced_window
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,7 @@ class RefDistributor:
         idle_timeout_s: Optional[float] = None,
         clock=time.monotonic,
         sleep=time.sleep,
+        cost_fn=None,
     ) -> None:
         if dp_size < 1:
             raise ValueError(f"dp_size must be >= 1, got {dp_size}")
@@ -134,6 +136,10 @@ class RefDistributor:
         self.refs_per_rank_batch = refs_per_rank_batch
         self.dispatch_quantum = dp_size * refs_per_rank_step
         self.dispatch_round_quantum = dp_size * refs_per_rank_batch
+        # Optional per-ref cost estimate (dispatch_balance.CostFn). With one,
+        # every secured optimizer window is planned as a whole: similar refs
+        # share micro-batches and ranks receive equal estimated work.
+        self._cost_fn = cost_fn
         self.worker_id = worker_id
         self.poll_s = poll_s
         self.idle_timeout_s = idle_timeout_s
@@ -263,6 +269,28 @@ class RefDistributor:
                 # Once secured, the window completes within this same loop.
                 if len(self._window) + queue.depth() < self.dispatch_quantum:
                     break
+            if self._cost_fn is not None:
+                # The whole window is committed locally (checked above), so
+                # plan and release it at once; it completes in this loop.
+                need = self.dispatch_quantum - len(self._window)
+                if need:
+                    self._window.extend(queue.get(need, timeout_s=0.0))
+                if len(self._window) < self.dispatch_quantum:
+                    break
+                rounds = plan_balanced_window(
+                    self._window,
+                    self.dp_size,
+                    self.refs_per_rank_batch,
+                    self.refs_per_rank_step // self.refs_per_rank_batch,
+                    self._cost_fn,
+                )
+                for round_batches in rounds:
+                    for inbox, refs in zip(self._inboxes, round_batches):
+                        inbox.publish_batch(refs)
+                self.stats["dispatched"] += self.dispatch_quantum
+                self._window = []
+                progress = True
+                continue
             need = self.dispatch_round_quantum - len(self._window)
             if need:
                 self._window.extend(queue.get(need, timeout_s=0.0))

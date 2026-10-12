@@ -292,19 +292,19 @@ def create_dflash_sdpa_mask(
     return final_mask
 
 
-def create_dflash_block_mask(
+# "0" builds DFlash block masks with ``create_block_mask`` (dense mask_mod
+# evaluation) instead of the analytic per-block ranges, for A/B comparisons.
+_ANALYTIC_BLOCK_MASK_ENV = "SPECFORGE_DFLASH_ANALYTIC_BLOCK_MASK"
+
+
+def _dflash_mask_mod(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
     S: int,
     block_size: int,
-    device: torch.device,
-    flex_block_size=None,
-    sliding_window: Optional[int] = None,
+    sliding_window: Optional[int],
 ):
-    """Construct a full or sliding Flex Attention mask for DFlash training."""
-
-    if sliding_window is not None and sliding_window <= 0:
-        raise ValueError("sliding_window must be > 0")
+    N = anchor_positions.shape[1]
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
@@ -332,15 +332,164 @@ def create_dflash_block_mask(
         in_bounds = q_block_id < N
         return (mask_context | mask_draft) & is_valid_block & in_bounds
 
+    return dflash_mask_mod
+
+
+def _ordered_block_indices(dense: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``[B, Q_BLOCKS, KV_BLOCKS]`` booleans -> (counts, ascending indices first)."""
+
+    counts = dense.sum(dim=-1, dtype=torch.int32)
+    # Stable sort of the complement puts the selected blocks first, ascending.
+    indices = torch.argsort((~dense).to(torch.int8), dim=-1, stable=True)
+    return counts.unsqueeze(1), indices.to(torch.int32).unsqueeze(1)
+
+
+def _analytic_dflash_block_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    S: int,
+    block_size: int,
+    sliding_window: Optional[int],
+    q_block: int,
+    kv_block: int,
+    mask_mod,
+):
+    """Build the DFlash ``BlockMask`` from per-block token ranges.
+
+    ``create_block_mask`` evaluates ``mask_mod`` on every (query, key) pair,
+    i.e. a dense ``B x (N*block) x (S + N*block)`` tensor per micro-batch. The
+    DFlash layout needs only two ranges per query block: the union of its
+    anchors' context windows and its own draft keys. Anchors are sorted, so a
+    query block's context union is ``[min_anchor - (W - 1), max_anchor)`` and
+    a key block is fully visible to every row exactly when it lies inside
+    ``[max_anchor + block - 1 - (W - 1), min_anchor)`` and every anchor in the
+    query block is kept. Every other touched block stays partial, so
+    ``mask_mod`` still decides each element; a block marked partial that holds
+    no visible key only adds masked scores, which leaves the result unchanged.
+    """
+
+    B, N = anchor_positions.shape
+    device = anchor_positions.device
+    Q_LEN = N * block_size
+    KV_LEN = S + Q_LEN
+    if q_block % block_size:
+        raise ValueError(
+            f"query block size {q_block} must be a multiple of block_size {block_size}"
+        )
+    anchors_per_q_block = q_block // block_size
+    num_q_blocks = -(-Q_LEN // q_block)
+    num_kv_blocks = -(-KV_LEN // kv_block)
+    pad = num_q_blocks * anchors_per_q_block - N
+
+    keep = block_keep_mask.to(torch.bool)
+    anchors = anchor_positions.to(torch.int64)
+    # Any value above every anchor (anchors are context positions < S).
+    big = S + 1
+    a_min = torch.where(keep, anchors, big)
+    a_max = torch.where(keep, anchors, -1)
+    all_kept = keep
+    if pad:
+        a_min = F.pad(a_min, (0, pad), value=big)
+        a_max = F.pad(a_max, (0, pad), value=-1)
+        all_kept = F.pad(all_kept, (0, pad), value=False)
+    a_min = a_min.view(B, num_q_blocks, anchors_per_q_block).amin(dim=-1)
+    a_max = a_max.view(B, num_q_blocks, anchors_per_q_block).amax(dim=-1)
+    all_kept = all_kept.view(B, num_q_blocks, anchors_per_q_block).all(dim=-1)
+    any_kept = a_max >= 0
+
+    kv_start = torch.arange(num_kv_blocks, device=device, dtype=torch.int64) * kv_block
+    kv_start = kv_start.view(1, 1, -1)
+    kv_end = kv_start + kv_block
+    a_min_ = a_min.unsqueeze(-1)
+    a_max_ = a_max.unsqueeze(-1)
+
+    if sliding_window is None:
+        ctx_lo = torch.zeros_like(a_min_)
+        full_lo = torch.zeros_like(a_min_)
+    else:
+        ctx_lo = (a_min_ - (sliding_window - 1)).clamp(min=0)
+        full_lo = (a_max_ + (block_size - 1) - (sliding_window - 1)).clamp(min=0)
+    touched = (kv_start < a_max_) & (kv_end > ctx_lo)
+
+    q_ids = torch.arange(num_q_blocks, device=device, dtype=torch.int64).view(1, -1, 1)
+    draft_lo = S + q_ids * q_block
+    draft_hi = S + torch.clamp((q_ids + 1) * q_block, max=Q_LEN)
+    touched = touched | ((kv_start < draft_hi) & (kv_end > draft_lo))
+    touched = touched & any_kept.unsqueeze(-1)
+
+    q_block_complete = ((q_ids + 1) * q_block <= Q_LEN).view(1, -1)
+    full = (
+        (kv_start >= full_lo)
+        & (kv_end <= a_min_)
+        & (all_kept & q_block_complete).unsqueeze(-1)
+    )
+    partial = touched & ~full
+
+    kv_num_blocks, kv_indices = _ordered_block_indices(partial)
+    full_kv_num_blocks, full_kv_indices = _ordered_block_indices(full)
+    return BlockMask.from_kv_blocks(
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        BLOCK_SIZE=(q_block, kv_block),
+        mask_mod=mask_mod,
+        seq_lengths=(Q_LEN, KV_LEN),
+    )
+
+
+def create_dflash_block_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    S: int,
+    block_size: int,
+    device: torch.device,
+    flex_block_size=None,
+    sliding_window: Optional[int] = None,
+    analytic: Optional[bool] = None,
+):
+    """Construct a full or sliding Flex Attention mask for DFlash training.
+
+    ``anchor_positions`` must be sorted along each row (``_sample_anchor_positions``
+    returns them sorted) for the default analytic construction; pass
+    ``analytic=False`` to evaluate ``mask_mod`` densely with
+    ``create_block_mask`` instead.
+    """
+
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError("sliding_window must be > 0")
+
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
+    mask_mod = _dflash_mask_mod(
+        anchor_positions, block_keep_mask, S, block_size, sliding_window
+    )
+    if analytic is None:
+        analytic = os.environ.get(_ANALYTIC_BLOCK_MASK_ENV, "1") != "0"
+    if analytic:
+        if flex_block_size is None:
+            q_block = kv_block = 128
+        elif isinstance(flex_block_size, int):
+            q_block = kv_block = flex_block_size
+        else:
+            q_block, kv_block = flex_block_size
+        return _analytic_dflash_block_mask(
+            anchor_positions,
+            block_keep_mask,
+            S,
+            block_size,
+            sliding_window,
+            q_block,
+            kv_block,
+            mask_mod,
+        )
 
     kwargs = {}
     if flex_block_size is not None:
         kwargs["BLOCK_SIZE"] = flex_block_size
     return create_block_mask(
-        dflash_mask_mod,
+        mask_mod,
         B=B,
         H=None,
         Q_LEN=Q_LEN,

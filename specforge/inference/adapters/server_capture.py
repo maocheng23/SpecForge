@@ -303,6 +303,13 @@ class SGLangServerCaptureAdapter:
         num_tokens = int(task.metadata.get("num_tokens", 0)) or len(
             task.payload["input_ids"]
         )
+        extra_metadata: Dict[str, Any] = {}
+        loss_mask = task.payload.get("loss_mask")
+        if loss_mask is not None:
+            from specforge.runtime.data_plane.dispatch_balance import loss_pairs
+
+            # Trainer-side work estimate for cost-balanced dispatch.
+            extra_metadata["loss_pairs"] = loss_pairs(loss_mask)
         return SampleRef(
             sample_id=sample_id,
             run_id=self.run_id,
@@ -325,6 +332,7 @@ class SGLangServerCaptureAdapter:
                 "transport": "sglang_server_capture",
                 "server": self.base_url,  # which server captured it (provenance)
                 "generation": gen,  # the zero-copy get() locator
+                **extra_metadata,
             },
         )
 

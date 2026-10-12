@@ -114,6 +114,7 @@ class Trainer:
         sp_ring_size: int = 1,
         dataloader_num_workers: int = 0,
         profiling_options=None,
+        detailed_metrics: Optional[str] = None,
         fit_context=None,
         on_fit_success: Optional[Callable[[int], None]] = None,
         on_fit_failure: Optional[Callable[[BaseException], None]] = None,
@@ -481,6 +482,7 @@ class Trainer:
             start_samples=resume["epoch_samples"] if resume else 0,
             data_prepositioned=data_prepositioned,
             profiling_options=profiling_options,
+            detailed_metrics=detailed_metrics,
             # Overlap each optimizer boundary's durable ack with the next step
             # (TrainerController flushes it before eval/checkpoint/return).
             async_ack=bool(async_ack and ack_fn is not None),

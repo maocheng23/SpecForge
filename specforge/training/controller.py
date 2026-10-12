@@ -402,6 +402,33 @@ def _reduce_eagle3_metrics(
     return result
 
 
+_DETAILED_METRICS_ENV = "SPECFORGE_DETAILED_METRICS"
+_DETAILED_METRICS_MODES = ("all", "last_microbatch")
+
+
+def _detailed_metrics_mode(configured: Optional[str] = None) -> str:
+    """Resolve which micro-batches of a log step run the detailed metrics.
+
+    Unset, empty or ``all`` keeps every micro-batch of the log step's
+    accumulation window. ``last_microbatch`` runs the detached diagnostics on
+    the boundary micro-batch only: ratio metrics then estimate the same
+    quantities from ``1 / accumulation_steps`` of the step's samples, and
+    count metrics total that micro-batch only (the logged
+    ``detailed_metrics/microbatch_fraction`` records the coverage).
+    """
+    mode = (
+        os.environ.get(_DETAILED_METRICS_ENV, "").strip().lower()
+        or (configured or "").strip().lower()
+        or "all"
+    )
+    if mode not in _DETAILED_METRICS_MODES:
+        raise ValueError(
+            f"{_DETAILED_METRICS_ENV}={mode!r}; expected one of "
+            f"{list(_DETAILED_METRICS_MODES)}"
+        )
+    return mode
+
+
 class TrainerCore:
     """One step: forward/loss (strategy) -> backward (backend) -> optimizer boundary."""
 
@@ -765,6 +792,7 @@ class TrainerController:
         checkpoint_extra: Optional[Dict[str, Any]] = None,
         profiling_options=None,
         async_ack: bool = False,
+        detailed_metrics: Optional[str] = None,
     ) -> None:
         if (start_batch == 0) != (start_samples == 0):
             raise ValueError(
@@ -779,6 +807,10 @@ class TrainerController:
         self.eval_interval = eval_interval
         self.eval_data_factory = eval_data_factory
         self.log_interval = log_interval
+        # Resolved once so every micro-step (and every rank) gates alike.
+        self._detailed_metrics_last_microbatch = (
+            _detailed_metrics_mode(detailed_metrics) == "last_microbatch"
+        )
         # Injected manager (rotation, best metric) or the lazy default layout.
         self._checkpoint_mgr = checkpoint_manager
         # Extra entries merged into the shared checkpoint payload at save
@@ -970,6 +1002,11 @@ class TrainerController:
                         collect_detailed_metrics=(
                             self.logger is not None
                             and (self.global_step + 1) % max(1, self.log_interval) == 0
+                            and (
+                                not self._detailed_metrics_last_microbatch
+                                or self.core.accumulation_remainder
+                                == self.core.accumulation_steps - 1
+                            )
                         ),
                     ),
                 )
@@ -1000,6 +1037,10 @@ class TrainerController:
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
+                    if self._detailed_metrics_last_microbatch:
+                        log_metrics["detailed_metrics/microbatch_fraction"] = (
+                            1.0 / self.core.accumulation_steps
+                        )
                     perf_elapsed_s = max(
                         time.perf_counter() - perf_window_started,
                         1e-12,

@@ -478,6 +478,13 @@ class RuntimeConfig(StrictConfigModel):
     resident_low_watermark_bytes: Optional[int] = Field(default=None, ge=0)
     feature_store_max_resident_bytes: Optional[int] = Field(default=None, gt=0)
     feature_store_max_quarantined_bytes: int = Field(default=8 << 30, ge=0)
+    #: DFlash-family online consumers: plan every optimizer window as a whole,
+    #: packing refs of similar estimated trainer work (kept anchors, tokens)
+    #: into micro-batches and assigning them to DP ranks longest-first, so
+    #: ranks reach the gradient reduction together and micro-batches pad less.
+    #: The step objective is unchanged (gradients use the step's global loss
+    #: denominator). ``SPECFORGE_BALANCED_DISPATCH=1`` also enables it.
+    balanced_dispatch: bool = False
 
     @model_validator(mode="after")
     def _validate_watermarks(self):
@@ -958,6 +965,13 @@ class TrainingConfig(StrictConfigModel):
     #: writing it and the trainer from fetching it (one ``hidden_size`` row per
     #: token next to the ``len(target_layer_ids) * hidden_size`` aux row).
     dflash_teacher_metrics: bool = True
+    #: Which micro-batches of a log step run the detached diagnostics
+    #: (full-vocabulary softmax/top-k over every block row). ``all`` keeps
+    #: every micro-batch; ``last_microbatch`` runs them on the boundary
+    #: micro-batch only, so ratio metrics are estimated from
+    #: ``1 / accumulation_steps`` of the step's samples. Online disaggregated
+    #: consumers honor it; ``SPECFORGE_DETAILED_METRICS`` overrides it.
+    detailed_metrics: Literal["all", "last_microbatch"] = "all"
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1
