@@ -298,6 +298,7 @@ Common fields:
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
 | `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
 | `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
+| `training.detailed_metrics` | `all` | Online disaggregated consumers. `last_microbatch` runs the log-step diagnostics (full-vocabulary softmax/top-k over every block row) on the boundary micro-batch only; ratio metrics are then estimated from `1 / accumulation_steps` of the step's samples. The loss is unchanged. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
@@ -470,6 +471,7 @@ unless tuning throughput or memory pressure.
 | `runtime.resident_low_watermark_bytes` | `null` | Optional byte-level resume threshold; requires and cannot exceed the resident high watermark. |
 | `runtime.feature_store_max_resident_bytes` | `null` | Optional hard store budget; it cannot be smaller than the resident high watermark. |
 | `runtime.feature_store_max_quarantined_bytes` | `8589934592` | Per-process Mooncake receive-buffer quarantine limit; exceeding it fails loudly. |
+| `runtime.balanced_dispatch` | `false` | DFlash-family online consumers. Plans each optimizer window as a whole: refs of similar estimated trainer work share micro-batches and DP ranks receive equal work, so ranks reach the gradient reduction together and micro-batches pad less. The step objective is unchanged. |
 
 ### `tracking`: experiment logging
 

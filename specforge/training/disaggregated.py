@@ -810,6 +810,8 @@ def _build_online(
         total_steps = _read_online_total_steps(cfg, channel_path)
     bundle = build_model_bundle(cfg)
     trainer = build_disagg_online_consumer(
+        dispatch_cost_fn=_dispatch_cost_fn(cfg, bundle),
+        detailed_metrics=cfg.training.detailed_metrics,
         algorithm=algorithm,
         modality=modality,
         feature_store=store,
@@ -841,6 +843,31 @@ def _build_online(
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)
+
+
+def _dispatch_cost_fn(cfg: Config, bundle):
+    """Cost-balanced window dispatch for DFlash-family drafts (opt-in)."""
+    from specforge.runtime.data_plane.dispatch_balance import (
+        BALANCED_DISPATCH_ENV,
+        balanced_dispatch_enabled,
+        dflash_dispatch_cost_fn,
+    )
+
+    if not (cfg.runtime.balanced_dispatch or balanced_dispatch_enabled()):
+        return None
+    draft_model = getattr(bundle.model, "draft_model", bundle.model)
+    draft_config = getattr(draft_model, "config", None)
+    if draft_config is None or getattr(draft_config, "dflash_config", None) is None:
+        raise ValueError(
+            f"runtime.balanced_dispatch (or {BALANCED_DISPATCH_ENV}=1) needs a "
+            "DFlash-family draft config with dflash_config"
+        )
+    cost_fn = dflash_dispatch_cost_fn(draft_config, int(cfg.training.num_anchors))
+    if cost_fn is None:
+        raise ValueError(
+            "runtime.balanced_dispatch: cannot derive costs from the draft config"
+        )
+    return cost_fn
 
 
 def build_disaggregated_run(

@@ -1553,6 +1553,8 @@ def build_disagg_online_consumer(
     dataloader_num_workers: int = 0,
     profiling_options=None,
     async_ack: Optional[bool] = None,
+    dispatch_cost_fn=None,
+    detailed_metrics: Optional[str] = None,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1727,6 +1729,7 @@ def build_disagg_online_consumer(
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
+                cost_fn=dispatch_cost_fn,
             )
             inbox_server_url = os.environ.get("DISAGG_INBOX_SERVER_URL")
             if inbox_server_url:
@@ -1898,6 +1901,7 @@ def build_disagg_online_consumer(
             resume_from=resume_from,
             dataloader_num_workers=dataloader_num_workers,
             profiling_options=profiling_options,
+            detailed_metrics=detailed_metrics,
             async_ack=async_ack,
             on_fit_success=mark_consumer_done,
             on_fit_failure=mark_consumer_failed,
