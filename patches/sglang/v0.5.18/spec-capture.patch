@@ -1,3 +1,65 @@
+diff --git a/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py b/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
+index 64d81b9..f5adf44 100644
+--- a/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
++++ b/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
+@@ -372,6 +372,32 @@ def fused_qkv_split_gdn_prefill_kernel(
+     tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
+ 
+ 
++@triton.jit
++def fused_qkv_split_gdn_prefill_chunked_kernel(
++    q,
++    k,
++    v,
++    mixed_qkv,
++    stride_t,
++    stride_d,
++    Q_DIM: tl.constexpr,
++    K_DIM: tl.constexpr,
++    V_DIM: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    i_t = tl.program_id(0).to(tl.int64)
++    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    QK_DIM: tl.constexpr = Q_DIM + K_DIM
++    QKV_DIM: tl.constexpr = QK_DIM + V_DIM
++    mask = offsets < QKV_DIM
++    values = tl.load(mixed_qkv + i_t * stride_t + offsets * stride_d, mask=mask)
++    tl.store(q + i_t * Q_DIM + offsets, values, mask=offsets < Q_DIM)
++    k_mask = (offsets >= Q_DIM) & (offsets < QK_DIM)
++    tl.store(k + i_t * K_DIM + offsets - Q_DIM, values, mask=k_mask)
++    v_mask = (offsets >= QK_DIM) & mask
++    tl.store(v + i_t * V_DIM + offsets - QK_DIM, values, mask=v_mask)
++
++
+ def fused_qkv_split_gdn_prefill(
+     mixed_qkv: torch.Tensor,
+     num_q_heads: int,
+@@ -408,6 +434,24 @@ def fused_qkv_split_gdn_prefill(
+     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
+     if _is_hip and seq_len == 0:
+         return q, k, v
++    if triton.next_power_of_2(qkv_dim) > 8192:
++        if seq_len == 0:
++            return q, k, v
++        chunk = 1024
++        fused_qkv_split_gdn_prefill_chunked_kernel[(seq_len, triton.cdiv(qkv_dim, chunk))](
++            q,
++            k,
++            v,
++            mixed_qkv,
++            mixed_qkv.stride(0),
++            mixed_qkv.stride(1),
++            num_q_heads * head_q,
++            num_k_heads * head_k,
++            num_v_heads * head_v,
++            BLOCK_SIZE=chunk,
++            num_warps=4,
++        )
++        return q, k, v
+     fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
+         q,
+         k,
 diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
 index 1f310d82a5..ff972fdf1a 100644
 --- a/python/sglang/kernels/ops/layernorm/mhc.py
@@ -12,8 +74,113 @@ index 1f310d82a5..ff972fdf1a 100644
      buckets = get_mhc_pre_token_count_representatives(
          max_num_tokens, hc_mult * hidden_size
      )
+diff --git a/python/sglang/kernels/ops/mamba/causal_conv1d_triton.py b/python/sglang/kernels/ops/mamba/causal_conv1d_triton.py
+index f677e15..ead9583 100644
+--- a/python/sglang/kernels/ops/mamba/causal_conv1d_triton.py
++++ b/python/sglang/kernels/ops/mamba/causal_conv1d_triton.py
+@@ -446,7 +446,14 @@ def causal_conv1d_fn(
+     if isinstance(activation, bool) and activation:
+         activation = "silu"
+ 
+-    out = torch.empty_like(x)
++    if x.dim() == 2 and x.stride(0) == 1 and x.stride(1) > x.shape[0]:
++        # Channel-last column slice of a wider tensor (SGLANG_GDN_NOCOPY): keep the
++        # output dense and channel-last so callers get row-major tokens back.
++        out = torch.empty(
++            (x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device
++        ).t()
++    else:
++        out = torch.empty_like(x)
+ 
+     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
+     dim, cu_seqlen = x.shape
+diff --git a/python/sglang/srt/layers/attention/flashattention_backend.py b/python/sglang/srt/layers/attention/flashattention_backend.py
+index 60a46b146c..d62e47f70b 100644
+--- a/python/sglang/srt/layers/attention/flashattention_backend.py
++++ b/python/sglang/srt/layers/attention/flashattention_backend.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+ 
+@@ -351,6 +352,16 @@ class FlashAttentionBackend(AttentionBackend):
+             and get_memory().disable_radix_cache
+             and not self.use_mla
+         )
++        # Spec-capture experiment (SGLANG_CAPTURE_FA_SKIP_KV=1, default off): the
++        # same varlen/no-KV-write path for generation-mode capture batches that
++        # are prefill-only with no prefix (ForwardBatch.spec_capture_prefill).
++        self.capture_skip_kv_cache = False
++        if os.environ.get("SGLANG_CAPTURE_FA_SKIP_KV", "0") == "1":
++            from sglang.srt.spec_capture_sink import capture_fa_skip_kv_supported
++
++            self.capture_skip_kv_cache = capture_fa_skip_kv_supported(
++                self, model_runner.server_args
++            )
+ 
+         # Skip the FA3 scheduler_metadata precompute (PR #21104) when distributed
+         # attention modes can change live cache_seqlens/num_splits across ranks.
+@@ -1190,10 +1201,17 @@ class FlashAttentionBackend(AttentionBackend):
+             and self.attn_cp_size > 1
+         )
+ 
++        skip_kv_cache = self.fa_skip_kv_cache or (
++            self.capture_skip_kv_cache
++            and forward_batch.spec_capture_prefill is True
++            and not is_cp_mode
++            and not layer.is_cross_attention
++        )
++
+         if k is not None:
+             assert v is not None
+ 
+-            if save_kv_cache and not self.fa_skip_kv_cache:
++            if save_kv_cache and not skip_kv_cache:
+                 cache_loc = (
+                     forward_batch.out_cache_loc
+                     if not layer.is_cross_attention
+@@ -1437,7 +1455,7 @@ class FlashAttentionBackend(AttentionBackend):
+                         self.device,
+                         _fa_cp_attn,
+                     )
+-            elif self.fa_skip_kv_cache:
++            elif skip_kv_cache:
+                 # Embedding mode: skip KV cache read and use raw K/V tensors
+                 # directly via flash_attn_varlen_func. The KV cache write is
+                 # also skipped (guarded above). This eliminates store_kvcache
+diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+index 7a0d1ee..2de6de4 100644
+--- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
++++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+@@ -1,3 +1,4 @@
++import os
+ from typing import Optional, Tuple, Union
+ 
+ import torch
+@@ -35,6 +36,8 @@ if is_cuda() or is_hip() or is_xpu():
+     )
+ 
+ MAX_FUSED_QKV_SPLIT_DIM = 8192
++# SGLANG_GDN_NOCOPY=1: the chunked fused split handles any qkv_dim.
++_GDN_NOCOPY = os.environ.get("SGLANG_GDN_NOCOPY", "0") == "1"
+ 
+ if is_cuda():
+     from sglang.srt.layers.attention.mamba.causal_conv1d import (
+@@ -595,7 +598,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
+ 
+         actual_seq_len = mixed_qkv.shape[0]
+         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+-        if (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
++        if (is_cuda() or is_hip() or is_xpu()) and (
++            qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM or _GDN_NOCOPY
++        ):
+             query, key, value = fused_qkv_split_gdn_prefill(
+                 mixed_qkv,
+                 layer.num_q_heads,
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index 2487072b63..1a7d91a329 100644
+index 2487072b63..82b14b84a6 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
 @@ -102,6 +102,11 @@ class LogitsProcessorOutput:
@@ -28,6 +195,23 @@ index 2487072b63..1a7d91a329 100644
  
      ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
      # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
+@@ -352,6 +357,16 @@ class LogitsProcessor(nn.Module):
+         if _autotune_run_lm_head is False:
+             return LogitsProcessorOutput(next_token_logits=None)
+ 
++        # Spec-capture skip-tail (SGLANG_SPEC_CAPTURE_SKIP_TAIL): the model
++        # stopped at its last aux tap, so there is no final hidden state. The
++        # batch is prefill-only and samples nothing; return the aux taps only.
++        if hidden_states is None and aux_hidden_states is not None:
++            return LogitsProcessorOutput(
++                next_token_logits=None,
++                hidden_states=pack_aux_hidden_states(aux_hidden_states),
++                mm_input_embeds=logits_metadata.mm_input_embeds,
++            )
++
+         # Multi-item scoring only for prefill-only requests with pre-computed indices.
+         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
+             return self.compute_logprobs_for_multi_item_scoring(
 @@ -391,6 +396,30 @@ class LogitsProcessor(nn.Module):
              sample_indices,
              logits_metadata,
@@ -794,6 +978,36 @@ index 69d00c9af9..3b4f7956f5 100644
          if return_logprob:
              if self.logits_output.next_token_logprobs is not None:
                  self.logits_output.next_token_logprobs = _async_d2h(
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 0212e809a8..f829f5f9c2 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -437,6 +437,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+     dimensions: Optional[list[int]] = None
+     # Whether to return pooled hidden states (pre-head transformer output)
+     return_pooled_hidden_states: bool = False
++    # Spec-capture fast-path marks (spec_capture_sink); None unless their
++    # environment gates are on and the whole batch qualifies.
++    spec_capture_prefill: Optional[bool] = None
++    spec_capture_skip_tail: Optional[bool] = None
+ 
+     # For DP attention
+     is_extend_in_batch: bool = False
+@@ -806,6 +810,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+ 
+         ret._maybe_init_non_generation_fields(batch)
+ 
++        if (
++            getattr(model_runner.server_args, "enable_spec_capture", False)
++            and not model_runner.is_draft_worker
++        ):
++            from sglang.srt.spec_capture_sink import annotate_capture_forward_batch
++
++            annotate_capture_forward_batch(ret, batch, model_runner.server_args)
++
+         device = model_runner.device
+ 
+         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
 index 017198c76a..32a601fb5d 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
@@ -856,6 +1070,165 @@ index 017198c76a..32a601fb5d 100644
          )
          # Resolve before building: backends read the pair off the runner while
          # they construct (the FlashInfer KV-access check).
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 52a7033..2964cbb 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -24,6 +24,7 @@ import triton
+ 
+ # Layers - Attention
+ from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
++from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
+ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+     fused_qkvzba_split_reshape_cat_contiguous,
+ )
+@@ -142,6 +143,8 @@ _is_amx_available = cpu_has_amx_support()
+ # plus the `torch.cat` of the unfused fallback. Other backends keep the
+ # original tuple so their control flow is unchanged.
+ _GDN_FUSED_QKVZBA_RATIOS = (1, 2, 4, 8) if _use_aiter else (1, 2, 4)
++# SGLANG_GDN_NOCOPY=1: other ratios slice [q|k|v] instead of concatenating and keep z strided.
++_GDN_NOCOPY = get_bool_env_var("SGLANG_GDN_NOCOPY") and _is_cuda
+ 
+ cached_get_processor = lru_cache(get_processor)
+ 
+@@ -668,10 +671,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             b = b.contiguous()
+             a = a.contiguous()
+ 
+-            query, key, value = map(
+-                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+-            )
+-            mixed_qkv = torch.cat((query, key, value), dim=-1)
++            if _GDN_NOCOPY and projected_states_qkvz.dim() == 2:
++                # fix_query_key_value_ordering only splits [q | k | v | z], so the
++                # leading q|k|v columns are one strided view: no concatenation.
++                qkv_width = (
++                    2 * (self.key_dim // self.attn_tp_size)
++                    + self.value_dim // self.attn_tp_size
++                )
++                mixed_qkv = projected_states_qkvz[:, :qkv_width]
++            else:
++                query, key, value = map(
++                    lambda x: x.reshape(x.shape[0], -1), (query, key, value)
++                )
++                mixed_qkv = torch.cat((query, key, value), dim=-1)
+ 
+         core_attn_out = self.attn(
+             forward_batch,
+@@ -681,6 +693,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+         )
+ 
+         z_shape_og = z.shape
++        if (
++            _GDN_NOCOPY
++            and z.dim() == 3
++            and core_attn_out.numel() == z.numel()
++            and z.stride(-1) == 1
++            and z.stride(-2) == z.shape[-1]
++        ):
++            # Normalize each head as one group of a [T, H * D] row so the strided z
++            # view needs no copy; the per-group arithmetic matches the per-row path.
++            tokens, heads, head_dim = z.shape
++            weight = self.norm.weight.repeat(heads)
++            core_attn_out = layernorm_fn(
++                core_attn_out.reshape(tokens, heads * head_dim),
++                weight,
++                self.norm.bias,
++                z=z.reshape(tokens, heads * head_dim),
++                eps=self.norm.eps,
++                group_size=head_dim,
++                norm_before_gate=self.norm.norm_before_gate,
++                is_rms_norm=True,
++                activation=self.norm.activation,
++            )
++            output, _ = self.out_proj(core_attn_out)
++            return output
+         # reshape input data into 2D tensor
+         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+         z = z.reshape(-1, z.shape[-1])
+@@ -1408,6 +1444,46 @@ class Qwen3_5ForCausalLM(nn.Module):
+     def end_layer(self) -> int:
+         return self._end_layer
+ 
++    def _spec_capture_skip_tail_layer(self, forward_batch) -> Optional[int]:
++        """Layer at which an aux-only capture batch may stop, else None.
++
++        Set by SGLANG_SPEC_CAPTURE_SKIP_TAIL through ForwardBatch (see
++        spec_capture_sink). Only the dense Qwen3.5 text model on a single
++        pipeline stage with DFlash-style taps (``_is_layer_to_capture``) opts
++        in; another model opts in by honouring the same ForwardBatch mark in
++        its layer loop and returning ``(None, aux_hidden_states)``.
++        """
++        if not forward_batch.spec_capture_skip_tail or get_is_capture_mode():
++            return None
++        from sglang.srt.spec_capture_sink import SKIP_TAIL_ENV, log_once
++
++        if self.config.model_type != "qwen3_5_text":
++            log_once(
++                f"{SKIP_TAIL_ENV}=1 ignored: model_type "
++                f"{self.config.model_type!r} is not qwen3_5_text"
++            )
++            return None
++        if not (self.pp_group.is_first_rank and self.pp_group.is_last_rank):
++            log_once(f"{SKIP_TAIL_ENV}=1 ignored: pipeline parallelism splits layers")
++            return None
++        tap_layers = [
++            layer_id
++            for layer_id in self.layers_to_capture
++            if self.start_layer <= layer_id < self.end_layer
++            and getattr(self.layers[layer_id], "_is_layer_to_capture", False)
++        ]
++        if not tap_layers or len(tap_layers) != len(self.layers_to_capture):
++            log_once(
++                f"{SKIP_TAIL_ENV}=1 ignored: aux taps {sorted(self.layers_to_capture)} "
++                "are not all DFlash-style layer-input taps"
++            )
++            return None
++        log_once(
++            f"{SKIP_TAIL_ENV}=1: aux-only capture batches stop after layer "
++            f"{max(tap_layers)}'s input tap of {self.end_layer} layers"
++        )
++        return max(tap_layers)
++
+     @torch.no_grad()
+     def forward(
+         self,
+@@ -1431,12 +1507,24 @@ class Qwen3_5ForCausalLM(nn.Module):
+             residual = pp_proxy_tensors["residual"]
+ 
+         aux_hidden_states = []
++        skip_tail_layer = self._spec_capture_skip_tail_layer(forward_batch)
+         # Pass through decoder layers
+         for layer_idx in range(self.start_layer, self.end_layer):
+             layer = self.layers[layer_idx]
+             with get_global_expert_distribution_recorder().with_current_layer(
+                 layer_idx
+             ):
++                if layer_idx == skip_tail_layer:
++                    # Spec-capture skip-tail: the last aux tap is the residual
++                    # this layer's prepare_attn produces, the same call the
++                    # layer itself makes first; nothing after it is consumed.
++                    layer.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
++                        hidden_states,
++                        residual,
++                        forward_batch,
++                        captured_last_layer_outputs=aux_hidden_states,
++                    )
++                    break
+                 hidden_states, residual = layer(
+                     positions=positions,
+                     hidden_states=hidden_states,
+@@ -1460,6 +1548,10 @@ class Qwen3_5ForCausalLM(nn.Module):
+                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                 )
+ 
++        if skip_tail_layer is not None:
++            # No final norm; the LogitsProcessor returns only the aux taps.
++            return None, aux_hidden_states
++
+         # Return intermediate tensors for pipeline parallelism
+         if not self.pp_group.is_last_rank:
+             return PPProxyTensors(
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
 index 5c4f3ff44a..c40bcc6c42 100644
 --- a/python/sglang/srt/server_args.py
@@ -892,10 +1265,10 @@ index 5c4f3ff44a..c40bcc6c42 100644
          "Enable returning routed experts of each layer with responses.",
 diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
 new file mode 100644
-index 0000000..37692fd
+index 0000000..3184a17
 --- /dev/null
 +++ b/python/sglang/srt/spec_capture_sink.py
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,609 @@
 +# Copyright 2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -926,6 +1299,20 @@ index 0000000..37692fd
 +``MooncakeFeatureStore``). CUDA capture uses device publication on RDMA by
 +default. ``SGLANG_SPEC_CAPTURE_GPU_PUT=0`` selects host publication; ``1``
 +explicitly enables device publication and requires RDMA.
++
++Experimental capture-server fast paths, all off unless their variable is
++``1`` (see the helpers at the end of this module):
++
++* ``SGLANG_SPEC_CAPTURE_SKIP_TAIL`` -- stop the target forward after the last
++  aux tap for batches whose requests all capture aux only (Qwen3.5 dense text
++  model; other models ignore the flag).
++* ``SGLANG_CAPTURE_FA_SKIP_KV`` -- run FA3 prefill of capture batches through
++  the varlen kernel on raw K/V and skip the paged KV-cache write.
++
++``SGLANG_SPEC_CAPTURE_DEBUG_DUMP=<dir>`` is a parity-check mode: every staged
++sample is written with ``torch.save`` to ``<dir>/<store_id>_<sample_id>_g<gen>.pt``
++(other characters than ``[A-Za-z0-9.-]`` become ``_``) and Mooncake is never
++contacted. Never set it on a training server.
 +"""
 +
 +from __future__ import annotations
@@ -959,6 +1346,10 @@ index 0000000..37692fd
 +
 +_ARTIFACT_AUX = "aux"
 +_ARTIFACT_LAST_HIDDEN = "last_hidden"
++
++SKIP_TAIL_ENV = "SGLANG_SPEC_CAPTURE_SKIP_TAIL"
++FA_SKIP_KV_ENV = "SGLANG_CAPTURE_FA_SKIP_KV"
++DEBUG_DUMP_ENV = "SGLANG_SPEC_CAPTURE_DEBUG_DUMP"
 +
 +
 +def gpu_put_enabled() -> bool:
@@ -1111,7 +1502,8 @@ index 0000000..37692fd
 +        if not samples:
 +            return []
 +
-+        store = self._connect()
++        dump_dir = os.environ.get(DEBUG_DUMP_ENV)
++        store = None if dump_dir else self._connect()
 +        timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
 +        gpu_put = gpu_put_enabled()
 +        started = time.perf_counter()
@@ -1221,6 +1613,9 @@ index 0000000..37692fd
 +        for device in {t.device for t in tensors if t.is_cuda}:
 +            # Complete any contiguous copies made by this writer thread.
 +            torch.cuda.current_stream(device).synchronize()
++        if dump_dir:
++            _dump_staged_samples(dump_dir, keys, tensors)
++            return results
 +        materialize_ms = (time.perf_counter() - started) * 1000.0
 +        self._remove_many_quiet(replace_keys)
 +        registered: List[int] = []
@@ -1351,3 +1746,135 @@ index 0000000..37692fd
 +
 +def get_sink() -> Optional[SpecCaptureSink]:
 +    return _SINK
++
++
++# -- experimental capture-server fast paths (all default off) ----------------
++_LOGGED_ONCE = set()
++
++
++def _env_enabled(name: str) -> bool:
++    return os.environ.get(name, "0") == "1"
++
++
++def log_once(message: str) -> None:
++    if message not in _LOGGED_ONCE:
++        _LOGGED_ONCE.add(message)
++        logger.info(message)
++
++
++def _dump_staged_samples(
++    dump_dir: str, keys: List[str], tensors: List[torch.Tensor]
++) -> None:
++    """Debug-dump mode: one ``torch.save`` file per sample instead of Mooncake."""
++    grouped: Dict[str, Dict[str, torch.Tensor]] = {}
++    for key, tensor in zip(keys, tensors):
++        prefix, name = key.rsplit("/", 1)
++        # A per-request view would serialize the whole batch storage.
++        grouped.setdefault(prefix, {})[name] = tensor.detach().to("cpu", copy=True)
++    os.makedirs(dump_dir, exist_ok=True)
++    for prefix, features in grouped.items():
++        filename = "".join(c if c.isalnum() or c in "-." else "_" for c in prefix)
++        path = os.path.join(dump_dir, f"{filename}.pt")
++        torch.save({"key_prefix": prefix, "features": features}, f"{path}.tmp")
++        os.replace(f"{path}.tmp", path)
++
++
++def _parallel_layout_blocks_fast_paths() -> bool:
++    from sglang.srt.runtime_context import get_parallel
++
++    parallel = get_parallel()
++    return bool(parallel.enable_dp_attention or parallel.enable_prefill_cp)
++
++
++def capture_prefill_flags(batch) -> Tuple[bool, bool]:
++    """Classify a ScheduleBatch for the capture fast paths.
++
++    Returns ``(prefill, aux_only)``. ``prefill`` holds for a plain EXTEND batch
++    whose requests are all prefill-only (``max_new_tokens == 0``) spec-capture
++    requests with no cached prefix and no logprobs, outside DP attention,
++    prefill context parallelism and two-batch overlap. ``aux_only`` further
++    requires every request to ask for ``aux`` and none for ``last_hidden``
++    (teacher metrics off). Warmup and ``/health_generate`` requests carry no
++    ``spec_capture`` and decode a token, so a batch that holds one, or any other
++    non-capture request, stays on the stock path.
++    """
++    reqs = getattr(batch, "reqs", None)
++    if not reqs or not batch.is_prefill_only or batch.return_logprob:
++        return False, False
++    if getattr(batch.forward_mode, "name", None) != "EXTEND":
++        return False, False
++    if batch.global_num_tokens is not None or batch.tbo_split_seq_index is not None:
++        return False, False
++    if any(batch.prefix_lens or ()):
++        return False, False
++    aux_only = True
++    for req in reqs:
++        spec = getattr(req, "spec_capture", None)
++        if spec is None:
++            return False, False
++        features = spec.get("features") or {}
++        if _ARTIFACT_AUX not in features or _ARTIFACT_LAST_HIDDEN in features:
++            aux_only = False
++    if _parallel_layout_blocks_fast_paths():
++        return False, False
++    return True, aux_only
++
++
++def annotate_capture_forward_batch(forward_batch, batch, server_args) -> None:
++    """Mark a ForwardBatch for the fast paths whose gates are on.
++
++    Called from ``ForwardBatch.init_new`` on capture servers. Both fields stay
++    at their stock ``None`` unless a gate is set and the batch qualifies.
++    Skip-tail also requires the radix cache off: the skipped layers leave the
++    request's KV and recurrent state unwritten, so nothing may cache them.
++    A qualifying batch that skip-tail must still run in full logs why once.
++    """
++    skip_tail = _env_enabled(SKIP_TAIL_ENV)
++    if not (skip_tail or _env_enabled(FA_SKIP_KV_ENV)):
++        return
++    prefill, aux_only = capture_prefill_flags(batch)
++    if prefill:
++        forward_batch.spec_capture_prefill = True
++        log_once("spec-capture fast paths: a capture prefill batch qualified")
++        if not skip_tail:
++            return
++        if not server_args.disable_radix_cache:
++            log_once(f"{SKIP_TAIL_ENV}=1 ignored: the radix cache is on")
++        elif not aux_only:
++            log_once(
++                f"{SKIP_TAIL_ENV}=1 ignored: a capture batch asks for last_hidden "
++                "or no aux (teacher metrics on?)"
++            )
++        else:
++            forward_batch.spec_capture_skip_tail = True
++
++
++def capture_fa_skip_kv_supported(backend, server_args) -> bool:
++    """Whether an FA backend may skip the KV write for capture prefill batches.
++
++    The generation-mode analogue of ``fa_skip_kv_cache`` (embedding servers):
++    single-pass prefill, no radix cache, non-MLA, FA3, and a model-dtype KV
++    cache because the varlen path takes raw K/V with no FP8 descale.
++    """
++    if not _env_enabled(FA_SKIP_KV_ENV):
++        return False
++    checks = (
++        (getattr(server_args, "enable_spec_capture", False), "spec capture is off"),
++        (server_args.chunked_prefill_size == -1, "chunked prefill is on"),
++        (server_args.disable_radix_cache, "the radix cache is on"),
++        (not backend.use_mla, "the model uses MLA"),
++        (backend.fa_impl_ver == 3, f"FA version is {backend.fa_impl_ver}"),
++        (
++            backend.kv_cache_dtype_str == "auto",
++            f"KV cache dtype is {backend.kv_cache_dtype_str}",
++        ),
++        (not backend.has_local_attention, "the model uses local attention"),
++    )
++    reasons = [reason for ok, reason in checks if not ok]
++    log_once(
++        f"{FA_SKIP_KV_ENV}=1 ignored: {'; '.join(reasons)}"
++        if reasons
++        else f"{FA_SKIP_KV_ENV}=1: FA3 varlen prefill without KV write for "
++        "capture prefill batches"
++    )
++    return not reasons
